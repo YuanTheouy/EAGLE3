@@ -1,0 +1,21 @@
+2025-12-26 15:17:34,777 INFO    MainThread:1604704 [wandb_setup.py:_flush():80] Current SDK version is 0.23.1
+2025-12-26 15:17:34,777 INFO    MainThread:1604704 [wandb_setup.py:_flush():80] Configure stats pid to 1604704
+2025-12-26 15:17:34,777 INFO    MainThread:1604704 [wandb_setup.py:_flush():80] Loading settings from /root/.config/wandb/settings
+2025-12-26 15:17:34,777 INFO    MainThread:1604704 [wandb_setup.py:_flush():80] Loading settings from /workspace/SpecDecTest/EAGLE3/eagle/traineagle3/wandb/settings
+2025-12-26 15:17:34,777 INFO    MainThread:1604704 [wandb_setup.py:_flush():80] Loading settings from environment variables
+2025-12-26 15:17:34,778 INFO    MainThread:1604704 [wandb_init.py:setup_run_log_directory():714] Logging user logs to /workspace/SpecDecTest/EAGLE3/logs/wandb/offline-run-20251226_151734-vjwwjt5y/logs/debug.log
+2025-12-26 15:17:34,778 INFO    MainThread:1604704 [wandb_init.py:setup_run_log_directory():715] Logging internal logs to /workspace/SpecDecTest/EAGLE3/logs/wandb/offline-run-20251226_151734-vjwwjt5y/logs/debug-internal.log
+2025-12-26 15:17:34,778 INFO    MainThread:1604704 [wandb_init.py:init():841] calling init triggers
+2025-12-26 15:17:34,778 INFO    MainThread:1604704 [wandb_init.py:init():846] wandb.init called with sweep_config: {}
+config: {'bf16': {'enabled': True, 'auto_cast': True, 'loss_scale': 0, 'loss_scale_window': 1000, 'initial_scale_power': 14, 'hysteresis': 2, 'min_loss_scale': 1}, 'optimizer': {'type': 'AdamW', 'params': {'lr': 5e-05, 'weight_decay': 0.0, 'adam_w_mode': True, 'betas': [0.9, 0.95]}}, 'scheduler': {'type': 'WarmupDecayLR', 'params': {'warmup_min_lr': 0, 'warmup_max_lr': 5e-05, 'warmup_num_steps': 12000, 'total_num_steps': 800000}}, 'zero_optimization': {'stage': 2, 'stage3_gather_16bit_weights_on_model_save': True, 'allgather_partitions': True, 'allgather_bucket_size': 200000000.0, 'overlap_comm': True, 'reduce_scatter': True, 'reduce_bucket_size': 200000000.0, 'contiguous_gradients': True}, 'distributed_port': 29601, 'distributed_port_range': 10, 'gradient_accumulation_steps': 1, 'gradient_clipping': 0.5, 'steps_per_print': 2000, 'train_micro_batch_size_per_gpu': 2, 'wall_clock_breakdown': False, '_wandb': {}}
+2025-12-26 15:17:34,778 INFO    MainThread:1604704 [wandb_init.py:init():889] starting backend
+2025-12-26 15:17:35,036 INFO    MainThread:1604704 [wandb_init.py:init():892] sending inform_init request
+2025-12-26 15:17:35,038 INFO    MainThread:1604704 [wandb_init.py:init():900] backend started and connected
+2025-12-26 15:17:35,041 INFO    MainThread:1604704 [wandb_init.py:init():970] updated telemetry
+2025-12-26 15:17:35,045 INFO    MainThread:1604704 [wandb_init.py:init():994] communicating run to backend with 90.0 second timeout
+2025-12-26 15:17:35,164 INFO    MainThread:1604704 [wandb_init.py:init():1041] starting run threads in backend
+2025-12-26 15:17:35,232 INFO    MainThread:1604704 [wandb_run.py:_console_start():2521] atexit reg
+2025-12-26 15:17:35,232 INFO    MainThread:1604704 [wandb_run.py:_redirect():2369] redirect: wrap_raw
+2025-12-26 15:17:35,232 INFO    MainThread:1604704 [wandb_run.py:_redirect():2438] Wrapping output streams.
+2025-12-26 15:17:35,232 INFO    MainThread:1604704 [wandb_run.py:_redirect():2461] Redirects installed.
+2025-12-26 15:17:35,233 INFO    MainThread:1604704 [wandb_init.py:init():1081] run started, returning control to user process

@@ -2,10 +2,13 @@
 
 # Default Configuration
 # Adjust these variables or override them via environment variables
-BASE_MODEL_PATH="${BASE_MODEL_PATH:-/workspace/Models/Llama-3.1-8B-Instruct}"
+BASE_MODEL_PATH="${BASE_MODEL_PATH:-/workspace/Models/Qwen2.5-7B-Instruct}"
+#TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/workspace/datasets/regenerated_complete_train_T00.jsonl}"
+#TEST_DATA_PATH="${TEST_DATA_PATH:-/workspace/datasets/regenerated_complete_test_T00.jsonl}"
 TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/workspace/datasets/regenerated_complete_test_T00_top1000.jsonl}"
 TEST_DATA_PATH="${TEST_DATA_PATH:-/workspace/datasets/regenerated_complete_test_T00_top1000.jsonl}"
-SAVE_DIR="${SAVE_DIR:-/workspace/Models/EAGLE-Qwen-2.5-v3}"
+
+SAVE_DIR="${SAVE_DIR:-/workspace/Models/EAGLE-Qwen2.5-7B-v3}"
 
 # Training resources
 INCLUDE_GPUS="${INCLUDE_GPUS:-localhost:0,1,2,3,4,5,6,7}"
@@ -21,7 +24,7 @@ WANDB_DIR="$LOGS_DIR"  # wandb will create a 'wandb' subdirectory here
 mkdir -p "$WANDB_DIR"
 
 echo "=================================================="
-echo "Starting EAGLE Training"
+echo "Starting EAGLE Training (Qwen2)"
 echo "Project Root: $PROJECT_ROOT"
 echo "Logs Directory: $LOGS_DIR"
 echo "WandB Directory: $WANDB_DIR"
@@ -45,7 +48,7 @@ deepspeed \
     --include="$INCLUDE_GPUS" \
     --master_addr "$MASTER_ADDR" \
     --master_port "$MASTER_PORT" \
-    main.py \
+    main_qwen2.py \
     --deepspeed_config ds_config.json \
     --basepath "$BASE_MODEL_PATH" \
     --trainpath "$TRAIN_DATA_PATH" \

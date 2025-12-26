@@ -28,8 +28,9 @@ from torch import nn
 import os
 from transformers.integrations.deepspeed import HfDeepSpeedConfig
 from transformers.activations import ACT2FN
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer,AutoModelForCausalLM
 from modeling_llama_kv import LlamaForCausalLM
+# from modeling_qwen2_kv import Qwen2ForCausalLM
 from configs import EConfig
 from safetensors import safe_open
 from datasets import load_dataset
@@ -497,7 +498,8 @@ class Model(nn.Module):
         self.draft_vocab_size = config.draft_vocab_size
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.length = 7
-        self.target_model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
+        # self.target_model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
+        self.target_model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16)
         self.target_model.eval()
         self.fc=nn.Linear(self.hidden_size*3, self.hidden_size, bias=False)
         for param in self.target_model.parameters():
@@ -534,276 +536,296 @@ class Model(nn.Module):
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
 
-    def scandata(self, datapath, tokenizerpath):
+    def scandata(self, datapath, tokenizerpath, cache_path="cache.pt"):
         N = self.draft_vocab_size
-        if not os.path.exists("cache.pt"):
+        
+        if os.path.exists(cache_path):
+            try:
+                cache = torch.load(cache_path)
+                if cache["t2d"].shape[0] != self.vocab_size:
+                    print(f"Cache vocab size mismatch ({cache['t2d'].shape[0]} vs {self.vocab_size}). using new cache path.")
+                    cache_path = cache_path + f".{self.vocab_size}"
+            except Exception as e:
+                print(f"Error checking cache: {e}")
+
+        if not os.path.exists(cache_path):
             tokenizer = AutoTokenizer.from_pretrained(tokenizerpath)
             dataset = load_dataset('json', data_files=datapath)
             dataset = dataset['train']
             # dataset = dataset.select(range(96))
             original_columns1 = dataset.column_names
-            num_proc = 48
+            # num_proc = 48
+            num_proc = 1
 
 
-            # def preprocess_function(examples):
-            #     new_examples = {
-            #         # "conversation": [],
-            #         "input_ids": [],
-            #         "loss_mask": []
-            #     }
-            #     for i in range(len(examples['id'])):
-            #         messages = [
-            #             {"role": "system",
-            #              "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
-            #         ]
-            #         convroles = ["user", "assistant"]
-            #         roles = {"human": "user", "gpt": "assistant"}
-            #         source = examples['conversations'][i]
-            #         if not source:
-            #             continue
-            #         if roles[source[0]["from"]] != "user":
-            #             # Skip the first one if it is not from human
-            #             source = source[1:]
-            #         for j, sentence in enumerate(source):
-            #             role = roles[sentence["from"]]
-            #             assert role == convroles[j % 2], f"{i}"
-            #             # if sentence["from"]=="gpt":
-            #             #     sentence["value"]=" "+sentence["value"]
-            #             messages.append(
-            #                 {"role": role, "content": sentence["value"]}
-            #             )
-            #         conversation = tokenizer.apply_chat_template(
-            #             messages,
-            #             tokenize=False,
-            #             add_generation_prompt=False,
-            #         )
-
-            #         if not tokenizer.pad_token_id:
-            #             tokenizer.pad_token_id = tokenizer.unk_token_id
-
-            #         input_ids = tokenizer(
-            #             conversation,
-            #             return_tensors="pt",
-            #             add_special_tokens=False,
-            #         ).input_ids[0]
-            #         # When construct draft model vocab, 
-            #         # filter out samples which is longer than max_len,
-            #         # instead of truncating them.
-            #         if len(input_ids) > self.train_config["max_len"]:
-            #             continue
-            #         loss_mask = torch.ones_like(input_ids)
-            #         # print(i)
-
-            #         sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-
-            #         total_len = len(input_ids)
-
-            #         sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
-            #         turns = conversation.split(sep2)
-
-            #         print("渲染后的对话：", conversation)
-            #         print("sep2是否存在：", sep2 in conversation)
-            #         if len(turns) < 2:
-            #             continue  # 或者根据需求处理，例如记录日志后跳过
-
-            #         turns[1] = turns[0] + sep2 + turns[1]
-            #         turns = turns[1:]
-
-            #         cur_len = 1
-            #         loss_mask[:cur_len] = 0
-            #         for i, turn in enumerate(turns):
-            #             if turn == "":
-            #                 break
-            #             turn_len = len(tokenizer(turn).input_ids)
-
-            #             parts = turn.split(sep)
-            #             if len(parts) != 2:
-            #                 break
-            #             parts[0] += sep
-            #             # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
-            #             instruction_len = len(tokenizer(parts[0]).input_ids) - 1
-
-            #             # Ignore the user instructions
-            #             if i == 0:
-            #                 loss_mask[cur_len: cur_len + instruction_len - 2] = 0
-            #             else:
-            #                 loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
-            #             cur_len += turn_len
-            #             if i != 0:
-            #                 cur_len += 3
-            #             # cur_len+=2
-
-            #             # if i != 0 and not tokenizer.legacy:
-            #             #     # The legacy and non-legacy modes handle special tokens differently
-            #             #     cur_len -= 1
-
-            #         loss_mask[cur_len:] = 0
-
-            #         # new_examples["conversation"].append(conversation)
-            #         new_examples["input_ids"].append(input_ids[None, :])
-            #         new_examples["loss_mask"].append(loss_mask[None, :])
-
-            #     return new_examples
             def preprocess_function(examples):
                 new_examples = {
+                    # "conversation": [],
                     "input_ids": [],
                     "loss_mask": []
                 }
-                
-                # 定义角色映射，防止出现 KeyError
-                roles_map = {"human": "user", "gpt": "assistant", "system": "system", "user": "user", "assistant": "assistant"}
-                
                 for i in range(len(examples['id'])):
-                    try:
-                        source = examples['conversations'][i]
-                        if not source:
-                            continue
-
-                        # --- 1. 寻找第一个 User 发言 ---
-                        # 跳过开头可能的 system prompt 或其他非 user 内容
-                        start_idx = -1
-                        for idx, sent in enumerate(source):
-                            role_label = sent.get("from", "")
-                            if roles_map.get(role_label, "") == "user":
-                                start_idx = idx
-                                break
-                        
-                        if start_idx == -1:
-                            # 没找到 User 发言，该样本无效，跳过
-                            continue
-                            
-                        source = source[start_idx:]
-                        
-                        # --- 2. 验证对话轮次交替 (User -> Assistant -> User ...) ---
-                        # 构建 clean_messages
-                        messages = [
-                            {"role": "system", "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
-                        ]
-                        
-                        valid_sample = True
-                        expected_role = "user"
-                        
-                        temp_msgs = []
-                        for sentence in source:
-                            role_key = sentence.get("from", "")
-                            role = roles_map.get(role_key, "unknown")
-                            
-                            # 如果遇到无法识别的角色，认为样本脏了
-                            if role == "unknown":
-                                valid_sample = False
-                                break
-                                
-                            # 简单的交替检查：
-                            # 如果当前是 user，下一句期望是 assistant
-                            # 如果当前是 assistant，下一句期望是 user
-                            # (忽略 system，但在 Eagle 这种训练里通常只有 U/A)
-                            
-                            if role != expected_role:
-                                # 发现顺序不对（例如连续两个 user），丢弃该样本
-                                valid_sample = False
-                                break
-                            
-                            temp_msgs.append({"role": role, "content": sentence["value"]})
-                            
-                            # 翻转期望角色
-                            if expected_role == "user":
-                                expected_role = "assistant"
-                            else:
-                                expected_role = "user"
-                        
-                        if not valid_sample or len(temp_msgs) == 0:
-                            continue
-                            
-                        messages.extend(temp_msgs)
-
-                        # --- 3. 生成对话并 Tokenize ---
-                        conversation = tokenizer.apply_chat_template(
-                            messages,
-                            tokenize=False,
-                            add_generation_prompt=False,
-                        )
-                        
-                        # 强制修正换行符，确保后续 split 正常
-                        target_sep_pattern = "<|start_header_id|>assistant<|end_header_id|>"
-                        conversation = conversation.replace(target_sep_pattern + "\n", target_sep_pattern + "\n\n")
-
-                        if not tokenizer.pad_token_id:
-                            tokenizer.pad_token_id = tokenizer.unk_token_id
-
-                        input_ids = tokenizer(
-                            conversation,
-                            return_tensors="pt",
-                            add_special_tokens=False,
-                        ).input_ids[0]
-
-                        if len(input_ids) > self.train_config["max_len"]:
-                            continue
-                            
-                        loss_mask = torch.ones_like(input_ids)
-                        
-                        # --- 4. 计算 Mask (使用切分法) ---
-                        # 定义分隔符 (注意：这里不要硬编码 \n\n 在 split 里，除非你上面做了强制替换)
-                        # 为了保险，我们用 Tag 切分
-                        sep_tag = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>" 
-                        
-                        # 你的代码逻辑原本依赖 \n\n，这里为了兼容你的逻辑，我们假设上面 replace 成功了
-                        # 或者我们调整 split 逻辑
-                        
-                        # 这里我们沿用你原本的思路，但做防御
-                        sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-                        sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
-                        
-                        turns = conversation.split(sep2)
-                        
-                        if len(turns) < 2:
-                            continue
-
-                        turns[1] = turns[0] + sep2 + turns[1]
-                        turns = turns[1:]
-
-                        cur_len = 1
-                        loss_mask[:cur_len] = 0
-                        
-                        for k, turn in enumerate(turns):
-                            if turn == "":
-                                break
-                            
-                            turn_len = len(tokenizer(turn).input_ids)
-                            
-                            parts = turn.split(sep)
-                            if len(parts) != 2:
-                                # 切分失败，说明模板格式不对，跳过
-                                break
-                                
-                            parts[0] += sep
-                            # -2 是针对 Llama3 tokenizer 的魔术数字，需谨慎
-                            instruction_len = len(tokenizer(parts[0]).input_ids) - 1
-
-                            if k == 0:
-                                loss_mask[cur_len: cur_len + instruction_len - 2] = 0
-                            else:
-                                loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
-                                
-                            cur_len += turn_len
-                            if k != 0:
-                                cur_len += 3
-
-                        loss_mask[cur_len:] = 0
-
-                        new_examples["input_ids"].append(input_ids[None, :])
-                        new_examples["loss_mask"].append(loss_mask[None, :])
-                    
-                    except Exception as e:
-                        # 捕获所有异常，打印一下但不中断训练
-                        # print(f"Skipping sample {i} due to error: {e}")
+                    messages = [
+                        {"role": "system",
+                         "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
+                    ]
+                    convroles = ["user", "assistant"]
+                    roles = {"human": "user", "gpt": "assistant"}
+                    source = examples['conversations'][i]
+                    if not source:
                         continue
+                    if roles[source[0]["from"]] != "user":
+                        # Skip the first one if it is not from human
+                        source = source[1:]
+                    for j, sentence in enumerate(source):
+                        role = roles[sentence["from"]]
+                        assert role == convroles[j % 2], f"{i}"
+                        # if sentence["from"]=="gpt":
+                        #     sentence["value"]=" "+sentence["value"]
+                        messages.append(
+                            {"role": role, "content": sentence["value"]}
+                        )
+                    conversation = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                    )
+
+                    if not tokenizer.pad_token_id:
+                        tokenizer.pad_token_id = tokenizer.unk_token_id
+
+                    input_ids = tokenizer(
+                        conversation,
+                        return_tensors="pt",
+                        add_special_tokens=False,
+                    ).input_ids[0]
+                    # When construct draft model vocab, 
+                    # filter out samples which is longer than max_len,
+                    # instead of truncating them.
+                    if len(input_ids) > self.train_config["max_len"]:
+                        continue
+                    loss_mask = torch.ones_like(input_ids)
+                    # print(i)
+
+                    # sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+
+                    # total_len = len(input_ids)
+
+                    # sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
+
+
+                    sep = "<|im_start|>assistant"
+
+                    total_len = len(input_ids)
+
+                    sep2 = "<|im_start|>user"
+
+                    turns = conversation.split(sep2)
+
+                    # print("渲染后的对话：", conversation)
+                    # print("sep2是否存在：", sep2 in conversation)
+                    if len(turns) < 2:
+                        continue  # 或者根据需求处理，例如记录日志后跳过
+
+                    turns[1] = turns[0] + sep2 + turns[1]
+                    turns = turns[1:]
+
+                    cur_len = 1
+                    loss_mask[:cur_len] = 0
+                    for i, turn in enumerate(turns):
+                        if turn == "":
+                            break
+                        turn_len = len(tokenizer(turn).input_ids)
+
+                        parts = turn.split(sep)
+                        if len(parts) != 2:
+                            break
+                        parts[0] += sep
+                        # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
+                        instruction_len = len(tokenizer(parts[0]).input_ids) - 1
+
+                        # Ignore the user instructions
+                        if i == 0:
+                            loss_mask[cur_len: cur_len + instruction_len - 2] = 0
+                        else:
+                            loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
+                        cur_len += turn_len
+                        if i != 0:
+                            cur_len += 3
+                        # cur_len+=2
+
+                        # if i != 0 and not tokenizer.legacy:
+                        #     # The legacy and non-legacy modes handle special tokens differently
+                        #     cur_len -= 1
+
+                    loss_mask[cur_len:] = 0
+
+                    # new_examples["conversation"].append(conversation)
+                    new_examples["input_ids"].append(input_ids[None, :])
+                    new_examples["loss_mask"].append(loss_mask[None, :])
 
                 return new_examples
+            # def preprocess_function(examples):
+            #     new_examples = {
+            #         "input_ids": [],
+            #         "loss_mask": []
+            #     }
+                
+            #     # 定义角色映射，防止出现 KeyError
+            #     roles_map = {"human": "user", "gpt": "assistant", "system": "system", "user": "user", "assistant": "assistant"}
+                
+            #     for i in range(len(examples['id'])):
+            #         try:
+            #             source = examples['conversations'][i]
+            #             if not source:
+            #                 continue
+
+            #             # --- 1. 寻找第一个 User 发言 ---
+            #             # 跳过开头可能的 system prompt 或其他非 user 内容
+            #             start_idx = -1
+            #             for idx, sent in enumerate(source):
+            #                 role_label = sent.get("from", "")
+            #                 if roles_map.get(role_label, "") == "user":
+            #                     start_idx = idx
+            #                     break
+                        
+            #             if start_idx == -1:
+            #                 # 没找到 User 发言，该样本无效，跳过
+            #                 continue
+                            
+            #             source = source[start_idx:]
+                        
+            #             # --- 2. 验证对话轮次交替 (User -> Assistant -> User ...) ---
+            #             # 构建 clean_messages
+            #             messages = [
+            #                 {"role": "system", "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
+            #             ]
+                        
+            #             valid_sample = True
+            #             expected_role = "user"
+                        
+            #             temp_msgs = []
+            #             for sentence in source:
+            #                 role_key = sentence.get("from", "")
+            #                 role = roles_map.get(role_key, "unknown")
+                            
+            #                 # 如果遇到无法识别的角色，认为样本脏了
+            #                 if role == "unknown":
+            #                     valid_sample = False
+            #                     break
+                                
+            #                 # 简单的交替检查：
+            #                 # 如果当前是 user，下一句期望是 assistant
+            #                 # 如果当前是 assistant，下一句期望是 user
+            #                 # (忽略 system，但在 Eagle 这种训练里通常只有 U/A)
+                            
+            #                 if role != expected_role:
+            #                     # 发现顺序不对（例如连续两个 user），丢弃该样本
+            #                     valid_sample = False
+            #                     break
+                            
+            #                 temp_msgs.append({"role": role, "content": sentence["value"]})
+                            
+            #                 # 翻转期望角色
+            #                 if expected_role == "user":
+            #                     expected_role = "assistant"
+            #                 else:
+            #                     expected_role = "user"
+                        
+            #             if not valid_sample or len(temp_msgs) == 0:
+            #                 continue
+                            
+            #             messages.extend(temp_msgs)
+
+            #             # --- 3. 生成对话并 Tokenize ---
+            #             conversation = tokenizer.apply_chat_template(
+            #                 messages,
+            #                 tokenize=False,
+            #                 add_generation_prompt=False,
+            #             )
+                        
+            #             # 强制修正换行符，确保后续 split 正常
+            #             target_sep_pattern = "<|start_header_id|>assistant<|end_header_id|>"
+            #             conversation = conversation.replace(target_sep_pattern + "\n", target_sep_pattern + "\n\n")
+
+            #             if not tokenizer.pad_token_id:
+            #                 tokenizer.pad_token_id = tokenizer.unk_token_id
+
+            #             input_ids = tokenizer(
+            #                 conversation,
+            #                 return_tensors="pt",
+            #                 add_special_tokens=False,
+            #             ).input_ids[0]
+
+            #             if len(input_ids) > self.train_config["max_len"]:
+            #                 continue
+                            
+            #             loss_mask = torch.ones_like(input_ids)
+                        
+            #             # --- 4. 计算 Mask (使用切分法) ---
+            #             # 定义分隔符 (注意：这里不要硬编码 \n\n 在 split 里，除非你上面做了强制替换)
+            #             # 为了保险，我们用 Tag 切分
+            #             sep_tag = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>" 
+                        
+            #             # 你的代码逻辑原本依赖 \n\n，这里为了兼容你的逻辑，我们假设上面 replace 成功了
+            #             # 或者我们调整 split 逻辑
+                        
+            #             # 这里我们沿用你原本的思路，但做防御
+            #             sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            #             sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
+                        
+            #             turns = conversation.split(sep2)
+                        
+            #             if len(turns) < 2:
+            #                 continue
+
+            #             turns[1] = turns[0] + sep2 + turns[1]
+            #             turns = turns[1:]
+
+            #             cur_len = 1
+            #             loss_mask[:cur_len] = 0
+                        
+            #             for k, turn in enumerate(turns):
+            #                 if turn == "":
+            #                     break
+                            
+            #                 turn_len = len(tokenizer(turn).input_ids)
+                            
+            #                 parts = turn.split(sep)
+            #                 if len(parts) != 2:
+            #                     # 切分失败，说明模板格式不对，跳过
+            #                     break
+                                
+            #                 parts[0] += sep
+            #                 # -2 是针对 Llama3 tokenizer 的魔术数字，需谨慎
+            #                 instruction_len = len(tokenizer(parts[0]).input_ids) - 1
+
+            #                 if k == 0:
+            #                     loss_mask[cur_len: cur_len + instruction_len - 2] = 0
+            #                 else:
+            #                     loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
+                                
+            #                 cur_len += turn_len
+            #                 if k != 0:
+            #                     cur_len += 3
+
+            #             loss_mask[cur_len:] = 0
+
+            #             new_examples["input_ids"].append(input_ids[None, :])
+            #             new_examples["loss_mask"].append(loss_mask[None, :])
+                    
+            #         except Exception as e:
+            #             # 捕获所有异常，打印一下但不中断训练
+            #             # print(f"Skipping sample {i} due to error: {e}")
+            #             continue
+
+            #     return new_examples
 
             dataset = dataset.map(
                 preprocess_function,
                 batched=True,
-                num_proc=num_proc,
+                # num_proc=num_proc,
+                num_proc=1,
                 remove_columns=original_columns1,
                 load_from_cache_file=False
             )
@@ -874,7 +896,8 @@ class Model(nn.Module):
     @torch.no_grad()
     def dataprepare(self, input_ids, attention_mask, loss_mask):
         device = input_ids.device
-        outs = self.target_model(input_ids=input_ids, attention_mask=attention_mask)
+        # ADDED: output_hidden_states=True
+        outs = self.target_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
         hidden_states0 = outs.hidden_states[0]
         hidden_states1 = outs.hidden_states[1]
         hidden_states2 = outs.hidden_states[2]

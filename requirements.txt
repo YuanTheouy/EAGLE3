@@ -11,3 +11,8 @@ wandb
 datasets
 pyarrow
 deepspeed==0.16.0
+shortuuid
+fschat
+openai
+anthropic
+ray
