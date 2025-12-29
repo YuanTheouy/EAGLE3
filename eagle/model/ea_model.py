@@ -22,8 +22,34 @@ from .cnets1 import Model as Model1
 from .configs import EConfig
 
 
-class EaModel(nn.Module):
+'''
+整体是一个Eagle模型，包含一个基础模型和一个Eagle层
+1、常量自定义区
+2、初始化 
+3、类方法 from_pretrained
+4、前向传播 forward
+    _prepare_generation 生成资源准备
+    _check_termination 终止条件
+5、生成方法
+    EAGLE3生成 ea_generate / eagenerate
+    普通生成 naive_generate / naivegenerate
 
+
+'''
+
+
+class EaModel(nn.Module):
+    # Constants for generation
+    SEQUENCE_LENGTH_BUFFER = 10  # Buffer for sequence length adjustment
+    DEFAULT_TOTAL_TOKEN = 60      # Default total tokens for tree generation
+    DEFAULT_DEPTH = 7             # Default depth of the tree
+    DEFAULT_TOP_K = 10            # Default top-k value for sampling
+    DEFAULT_THRESHOLD = 1.0       # Default threshold for posterior evaluation
+    
+    # Constants for automatic total_token selection
+    TOTAL_TOKEN_CANDIDATES = [40, 48, 50, 56, 60]  # Candidate values for total_token
+    TOTAL_TOKEN_ADJUSTMENT_FACTORS = [1, 1.05, 1.07, 1.1, 1.13]  # Adjustment factors for timing
+    
     def __init__(
             self,
             use_eagle3,
@@ -46,6 +72,7 @@ class EaModel(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path, use_fast=False)
         self.use_eagle3 = use_eagle3
         config = EConfig.from_pretrained(ea_model_path)
+        
         with open(ea_model_path, "r") as f:
             con = json.loads(f.read())
         try:
@@ -92,18 +119,152 @@ class EaModel(nn.Module):
         """
         return self.tokenizer
 
+    def _prepare_generation(
+            self,
+            input_ids,
+            temperature,
+            top_p,
+            top_k,
+            max_length,
+            is_llama3
+    ):
+        """
+        Prepare common resources for generation methods.
+        
+        Args:
+            input_ids: Input token IDs
+            temperature: Sampling temperature
+            top_p: Top-p sampling parameter
+            top_k: Top-k sampling parameter
+            max_length: Maximum sequence length
+            is_llama3: Whether using Llama 3 model
+            
+        Returns:
+            Dictionary containing prepared resources:
+                - stop_token_id: Stop token ID for Llama 3
+                - logits_processor: Logits processor for sampling
+                - padding: Padding tensor
+                - input_ids_cloned: Cloned input IDs to avoid in-place modification
+                - past_key_values: Initialized past key values
+                - past_key_values_data: Past key values data
+                - current_length_data: Current length data
+                - input_len: Original input length
+                - adjusted_max_length: Adjusted maximum length
+        """
+        # Set up stop token ID for Llama 3
+        stop_token_id = None
+        if is_llama3:
+            stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        
+        # Prepare logits processor
+        if temperature > 1e-5:
+            logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
+        else:
+            logits_processor = None
+        
+        # Create padding tensor and clone input IDs
+        padding = (torch.zeros(1, 1, dtype=torch.long) - 1).to(input_ids.device)
+        input_ids_cloned = input_ids.clone()
+        
+        # Reset kv cache
+        self.ea_layer.reset_kv()
+        
+        # Initialize past key values
+        if hasattr(self, "past_key_values"):
+            past_key_values = self.past_key_values
+            past_key_values_data = self.past_key_values_data
+            current_length_data = self.current_length_data
+            current_length_data.zero_()
+        else:
+            past_key_values, past_key_values_data, current_length_data = initialize_past_key_values(
+                self.base_model, max_length=max_length
+            )
+            self.past_key_values = past_key_values
+            self.past_key_values_data = past_key_values_data
+            self.current_length_data = current_length_data
+        
+        # Calculate input length and adjust max_length
+        input_len = input_ids_cloned.shape[1]
+        reset_tree_mode(self)
+        adjusted_max_length = max_length - self.ea_layer.total_tokens - self.SEQUENCE_LENGTH_BUFFER
+        
+        return {
+            "stop_token_id": stop_token_id,
+            "logits_processor": logits_processor,
+            "padding": padding,
+            "input_ids_cloned": input_ids_cloned,
+            "past_key_values": past_key_values,
+            "past_key_values_data": past_key_values_data,
+            "current_length_data": current_length_data,
+            "input_len": input_len,
+            "adjusted_max_length": adjusted_max_length
+        }
+    
+    def _check_termination(
+            self,
+            input_ids,
+            input_len,
+            new_token,
+            max_new_tokens,
+            adjusted_max_length,
+            is_llama3,
+            stop_token_id
+    ):
+        """
+        Check if generation should terminate based on various conditions.
+        
+        Args:
+            input_ids: Current input token IDs
+            input_len: Original input length
+            new_token: Number of new tokens generated
+            max_new_tokens: Maximum number of new tokens to generate
+            adjusted_max_length: Adjusted maximum sequence length
+            is_llama3: Whether using Llama 3 model
+            stop_token_id: Stop token ID for Llama 3
+            
+        Returns:
+            bool: True if generation should terminate, False otherwise
+        """
+        # Check for stop token (Llama 3 specific)
+        if is_llama3 and stop_token_id is not None:
+            if stop_token_id in input_ids[0, input_len:].tolist():
+                return True
+        
+        # Check for EOS token
+        if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
+            return True
+        
+        # Check if max_new_tokens has been exceeded
+        if new_token > max_new_tokens:
+            return True
+        
+        # Check if sequence length exceeds adjusted_max_length
+        if input_ids.shape[1] > adjusted_max_length:
+            return True
+        
+        return False
+
     @classmethod
     def from_pretrained(
             cls,
             use_eagle3=True,
             base_model_path=None,
             ea_model_path=None,
-            total_token=60,
-            depth=7,
-            top_k=10,
-            threshold=1.0,
+            total_token=None,
+            depth=None,
+            top_k=None,
+            threshold=None,
             **kwargs,
     ):
+        # Set default values if not provided
+        if total_token is None:
+            total_token = cls.DEFAULT_TOTAL_TOKEN
+        if depth is None:
+            depth = cls.DEFAULT_DEPTH
+        if top_k is None:
+            top_k = cls.DEFAULT_TOP_K
+        if threshold is None:
+            threshold = cls.DEFAULT_THRESHOLD
         import os
         import time
         import torch
@@ -172,8 +333,8 @@ class EaModel(nn.Module):
         # ========== 原有逻辑：自动选择 total_token ==========
         if total_token == -1:
             device = model.base_model.model.layers[0].self_attn.q_proj.weight.device
-            cans = [40, 48, 50, 56, 60]
-            x = [1, 1.05, 1.07, 1.1, 1.13]
+            cans = cls.TOTAL_TOKEN_CANDIDATES
+            x = cls.TOTAL_TOKEN_ADJUSTMENT_FACTORS
             times = []
 
             for i in range(len(cans)):
@@ -234,48 +395,28 @@ class EaModel(nn.Module):
             is_llama3=False,
 
     ):
-        if is_llama3:
-            stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
-
-
-        if temperature > 1e-5:
-            logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
-        else:
-            logits_processor = None
-        # assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
-        # Avoid modifying the input_ids in-place
-
-        padding = (torch.zeros(1, 1, dtype=torch.long) - 1).to(input_ids.device)
-        input_ids = input_ids.clone()
-        self.ea_layer.reset_kv()
-
-        # Initialize the past key and value states
-        if hasattr(self, "past_key_values"):
-            past_key_values = self.past_key_values
-            past_key_values_data = self.past_key_values_data
-            current_length_data = self.current_length_data
-            # Reset the past key and value states
-            current_length_data.zero_()
-        else:
-            (
-                past_key_values,
-                past_key_values_data,
-                current_length_data,
-            ) = initialize_past_key_values(self.base_model,max_length=max_length)
-            self.past_key_values = past_key_values
-            self.past_key_values_data = past_key_values_data
-            self.current_length_data = current_length_data
-
-        input_len = input_ids.shape[1]
-        reset_tree_mode(self)
+        # Prepare common generation resources
+        generation_resources = self._prepare_generation(
+            input_ids, temperature, top_p, top_k, max_length, is_llama3
+        )
+        
+        stop_token_id = generation_resources["stop_token_id"]
+        logits_processor = generation_resources["logits_processor"]
+        padding = generation_resources["padding"]
+        input_ids = generation_resources["input_ids_cloned"]
+        past_key_values = generation_resources["past_key_values"]
+        past_key_values_data = generation_resources["past_key_values_data"]
+        current_length_data = generation_resources["current_length_data"]
+        input_len = generation_resources["input_len"]
+        adjusted_max_length = generation_resources["adjusted_max_length"]
+        
         # prefill
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
             input_ids, self, past_key_values, logits_processor
         )
         new_token = 0
-        max_length = max_length - self.ea_layer.total_tokens - 10
-        for idx in range(max_length):
-            # with Timer("all"):
+        
+        for idx in range(adjusted_max_length):
             self.base_model.model.tree_mask = tree_mask
 
             draft_tokens = draft_tokens.to(input_ids.device)
@@ -288,15 +429,14 @@ class EaModel(nn.Module):
                 input_ids,
                 retrieve_indices,
             )
-            # retrieve_indices=tree_buffers["retrieve_indices"]
-            # logits = logits[0, retrieve_indices]
+            
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
             candidates = draft_tokens[0, retrieve_indices]
             # verification
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
-            # print(accept_length)
+            
             # Adjusting the input sequence, draft model forward
             input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
                 input_ids,
@@ -313,16 +453,13 @@ class EaModel(nn.Module):
                 sample_p
             )
 
-            if is_llama3:
-                if stop_token_id in input_ids[0, input_len:].tolist():
-                    break
-
-            if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
+            # Check if generation should terminate
+            if self._check_termination(
+                    input_ids, input_len, new_token, max_new_tokens, 
+                    adjusted_max_length, is_llama3, stop_token_id
+            ):
                 break
-            if new_token > max_new_tokens:
-                break
-            if input_ids.shape[1] > max_length:
-                break
+        
         if not log:
             return input_ids
         else:
@@ -341,44 +478,24 @@ class EaModel(nn.Module):
             is_llama3=False,
 
     ):
-        if is_llama3:
-            stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
-
-
-        if temperature > 1e-5:
-            logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
-        else:
-            logits_processor = None
-        # assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
-        # Avoid modifying the input_ids in-place
-
-        padding = (torch.zeros(1, 1, dtype=torch.long) - 1).to(input_ids.device)
-        input_ids = input_ids.clone()
-        self.ea_layer.reset_kv()
-
-        # Initialize the past key and value states
-        if hasattr(self, "past_key_values"):
-            past_key_values = self.past_key_values
-            past_key_values_data = self.past_key_values_data
-            current_length_data = self.current_length_data
-            # Reset the past key and value states
-            current_length_data.zero_()
-        else:
-            (
-                past_key_values,
-                past_key_values_data,
-                current_length_data,
-            ) = initialize_past_key_values(self.base_model,max_length=max_length)
-            self.past_key_values = past_key_values
-            self.past_key_values_data = past_key_values_data
-            self.current_length_data = current_length_data
-
-        input_len = input_ids.shape[1]
-        reset_tree_mode(self)
+        # Prepare common generation resources
+        generation_resources = self._prepare_generation(
+            input_ids, temperature, top_p, top_k, max_length, is_llama3
+        )
+        
+        stop_token_id = generation_resources["stop_token_id"]
+        logits_processor = generation_resources["logits_processor"]
+        input_ids = generation_resources["input_ids_cloned"]
+        past_key_values = generation_resources["past_key_values"]
+        input_len = generation_resources["input_len"]
+        adjusted_max_length = generation_resources["adjusted_max_length"]
+        
+        # Initial forward pass
         outputs = self.base_model(input_ids, past_key_values=past_key_values, use_cache=True)
         new_token = 0
-        max_length = max_length - self.ea_layer.total_tokens - 10
-        for idx in range(max_length):
+        
+        for idx in range(adjusted_max_length):
+            # Generate next token
             if logits_processor is not None:
                 logits = outputs.logits[:, -1]
                 logits = logits_processor(None, logits)
@@ -386,20 +503,19 @@ class EaModel(nn.Module):
                 input_id = torch.multinomial(probabilities, 1)
             else:
                 input_id = outputs.logits[:, -1:].argmax(dim=-1)
+            
+            # Update outputs and input_ids
             outputs = self.base_model(input_id, use_cache=True, past_key_values=past_key_values)
             input_ids = torch.cat([input_ids, input_id], dim=-1)
             new_token += 1
 
-            if is_llama3:
-                if stop_token_id in input_ids[0, input_len:].tolist():
-                    break
-
-            if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
+            # Check if generation should terminate
+            if self._check_termination(
+                    input_ids, input_len, new_token, max_new_tokens, 
+                    adjusted_max_length, is_llama3, stop_token_id
+            ):
                 break
-            if new_token > max_new_tokens:
-                break
-            if input_ids.shape[1] > max_length:
-                break
+        
         if not log:
             return input_ids
         else:
@@ -418,51 +534,32 @@ class EaModel(nn.Module):
             is_llama3=False,
 
     ):
-        if is_llama3:
-            stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
-
-
-        if temperature > 1e-5:
-            logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
-        else:
-            logits_processor = None
-        # assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
-        # Avoid modifying the input_ids in-place
-
-        padding = (torch.zeros(1, 1, dtype=torch.long) - 1).to(input_ids.device)
-        input_ids = input_ids.clone()
-        self.ea_layer.reset_kv()
-
-        # Initialize the past key and value states
-        if hasattr(self, "past_key_values"):
-            past_key_values = self.past_key_values
-            past_key_values_data = self.past_key_values_data
-            current_length_data = self.current_length_data
-            # Reset the past key and value states
-            current_length_data.zero_()
-        else:
-            (
-                past_key_values,
-                past_key_values_data,
-                current_length_data,
-            ) = initialize_past_key_values(self.base_model,max_length=max_length)
-            self.past_key_values = past_key_values
-            self.past_key_values_data = past_key_values_data
-            self.current_length_data = current_length_data
-
-        input_len = input_ids.shape[1]
-        reset_tree_mode(self)
+        # Prepare common generation resources
+        generation_resources = self._prepare_generation(
+            input_ids, temperature, top_p, top_k, max_length, is_llama3
+        )
+        
+        stop_token_id = generation_resources["stop_token_id"]
+        logits_processor = generation_resources["logits_processor"]
+        padding = generation_resources["padding"]
+        input_ids = generation_resources["input_ids_cloned"]
+        past_key_values = generation_resources["past_key_values"]
+        past_key_values_data = generation_resources["past_key_values_data"]
+        current_length_data = generation_resources["current_length_data"]
+        input_len = generation_resources["input_len"]
+        adjusted_max_length = generation_resources["adjusted_max_length"]
+        
+        # Initialize tree structure
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
             input_ids, self, past_key_values, logits_processor
         )
         new_token = 0
-        max_length = max_length - self.ea_layer.total_tokens - 10
-        for idx in range(max_length):
-            # with Timer("all"):
+        
+        for idx in range(adjusted_max_length):
             self.base_model.model.tree_mask = tree_mask
 
             draft_tokens = draft_tokens.to(input_ids.device)
-            # with Timer("tree_decoding"):
+            # Target model forward, get logits
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,
@@ -471,15 +568,15 @@ class EaModel(nn.Module):
                 input_ids,
                 retrieve_indices,
             )
-            # retrieve_indices=tree_buffers["retrieve_indices"]
-            # logits = logits[0, retrieve_indices]
+            
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
             candidates = draft_tokens[0, retrieve_indices]
+            # verification
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
-            # print(accept_length)
-            # with Timer("update_inference_inputs"):
+            
+            # Adjusting the input sequence, draft model forward
             input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
                 input_ids,
                 candidates,
@@ -497,15 +594,11 @@ class EaModel(nn.Module):
 
             yield input_ids
 
-            if is_llama3:
-                if stop_token_id in input_ids[0, input_len:].tolist():
-                    break
-
-            if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
-                break
-            if new_token > max_new_tokens:
-                break
-            if input_ids.shape[1] > max_length:
+            # Check if generation should terminate
+            if self._check_termination(
+                    input_ids, input_len, new_token, max_new_tokens, 
+                    adjusted_max_length, is_llama3, stop_token_id
+            ):
                 break
 
     @torch.no_grad()
@@ -521,44 +614,24 @@ class EaModel(nn.Module):
             is_llama3=False,
 
     ):
-        if is_llama3:
-            stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
-
-
-        if temperature > 1e-5:
-            logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
-        else:
-            logits_processor = None
-        # assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
-        # Avoid modifying the input_ids in-place
-
-        padding = (torch.zeros(1, 1, dtype=torch.long) - 1).to(input_ids.device)
-        input_ids = input_ids.clone()
-        self.ea_layer.reset_kv()
-
-        # Initialize the past key and value states
-        if hasattr(self, "past_key_values"):
-            past_key_values = self.past_key_values
-            past_key_values_data = self.past_key_values_data
-            current_length_data = self.current_length_data
-            # Reset the past key and value states
-            current_length_data.zero_()
-        else:
-            (
-                past_key_values,
-                past_key_values_data,
-                current_length_data,
-            ) = initialize_past_key_values(self.base_model,max_length=max_length)
-            self.past_key_values = past_key_values
-            self.past_key_values_data = past_key_values_data
-            self.current_length_data = current_length_data
-
-        input_len = input_ids.shape[1]
-        reset_tree_mode(self)
+        # Prepare common generation resources
+        generation_resources = self._prepare_generation(
+            input_ids, temperature, top_p, top_k, max_length, is_llama3
+        )
+        
+        stop_token_id = generation_resources["stop_token_id"]
+        logits_processor = generation_resources["logits_processor"]
+        input_ids = generation_resources["input_ids_cloned"]
+        past_key_values = generation_resources["past_key_values"]
+        input_len = generation_resources["input_len"]
+        adjusted_max_length = generation_resources["adjusted_max_length"]
+        
+        # Initial forward pass
         outputs = self.base_model(input_ids, past_key_values=past_key_values, use_cache=True)
         new_token = 0
-        max_length = max_length - self.ea_layer.total_tokens - 10
-        for idx in range(max_length):
+        
+        for idx in range(adjusted_max_length):
+            # Generate next token
             if logits_processor is not None:
                 logits = outputs.logits[:, -1]
                 logits = logits_processor(None, logits)
@@ -566,20 +639,22 @@ class EaModel(nn.Module):
                 input_id = torch.multinomial(probabilities, 1)
             else:
                 input_id = outputs.logits[:, -1:].argmax(dim=-1)
-
+            
+            # Update outputs and input_ids
             outputs = self.base_model(input_id, use_cache=True, past_key_values=past_key_values)
             input_ids = torch.cat([input_ids, input_id], dim=-1)
             new_token += 1
-
+            
+            # Yield the current sequence
             yield input_ids
 
-            if is_llama3:
-                if stop_token_id in input_ids[0, input_len:].tolist():
-                    break
-
-            if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
+            # Check if generation should terminate
+            if self._check_termination(
+                    input_ids, input_len, new_token, max_new_tokens, 
+                    adjusted_max_length, is_llama3, stop_token_id
+            ):
                 break
-            if new_token > max_new_tokens:
-                break
-            if input_ids.shape[1] > max_length:
-                break
+    
+    # Aliases for backward compatibility
+    naivegenerate = naive_generate
+    eagenerate = ea_generate
