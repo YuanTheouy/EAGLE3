@@ -306,41 +306,67 @@ if args.local_rank == -1 and "LOCAL_RANK" in os.environ:
 '''
 模型与优化器初始化模块：构建 EAGLE 模型并封装 DeepSpeed
 '''
-
+# 1. 加载EAGLE模型的配置文件
+# EConfig是自定义的配置类（对应EAGLE模型），from_pretrained从指定路径加载配置参数（如模型结构、隐藏层维度等）
 config = EConfig.from_pretrained(train_config["config_path"])
+# 2. 初始化EAGLE模型
+# config：EAGLE模型配置
+# ds_config：DeepSpeed分布式训练配置
+# train_config：自定义训练超参（批次大小、最大长度等）
+# path：预训练模型（LLaMA-3.1-8B-Instruct）存放路径
+# load_emb=True：加载预训练模型的词嵌入层权重
+# load_head=True：加载预训练模型的预测头（输出层）权重
 model = Model(config, ds_config, train_config, path=args.basepath, load_emb=True, load_head=True)
 
 # 定义原生 AdamW 优化器
+# 3. 定义原生PyTorch AdamW优化器（此处为临时定义，后续DeepSpeed会重新封装，可作为备用）
+# model.parameters()：需要优化的模型参数
+# lr=1e-4：初始学习率（后续DeepSpeed中重新指定为5e-5，以DeepSpeed内配置为准）
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
-
+# 4. DeepSpeed核心初始化：封装模型和优化器，构建分布式训练引擎
+# args：命令行参数（包含local_rank、deepspeed配置路径等）
+# model：待封装的EAGLE模型
+# optimizer：传入重新定义的AdamW优化器（学习率5e-5，正式训练使用该配置）
+# model_parameters：模型参数，用于DeepSpeed管理参数更新
+# 返回值：
+# model_engine：DeepSpeed封装后的模型引擎（支持分布式训练、梯度累积、混合精度等）
+# optimizer：DeepSpeed封装后的优化器
+# 后两个下划线：占位符，无需使用（对应训练器和数据加载器，此处自定义数据加载，故忽略）
 model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
                                                      model=model,
                                                      optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5),
                                                      model_parameters=model.parameters(),
                                                      )
-
+# 5. 分布式进程同步屏障：等待所有GPU进程完成模型初始化，避免进程间执行顺序不一致导致的错误
 deepspeed.comm.barrier()
 
-
+# 6. 加载预训练模型对应的分词器（LLaMA-3.1分词器）
 tokenizer = AutoTokenizer.from_pretrained(args.basepath)
+# 7. 构建训练集和测试集：调用自定义的build_dataset_rank函数，完成数据预处理
 traindataset = build_dataset_rank(tokenizer, args.trainpath)
 testdataset = build_dataset_rank(tokenizer, args.testpath)
 
 
-
+# 8. EAGLE模型自定义方法：扫描训练数据，统计数据特征（如词汇分布、对话长度等，为模型训练提供辅助信息）
 model.scandata(args.trainpath, args.basepath)
 
-
+# 9. 定义损失函数：SmoothL1Loss（平滑L1损失，比L1损失更稳定，减少异常值影响）
+# reduction="none"：不自动对损失进行聚合（返回每个样本/每个token的损失，方便后续结合loss_mask筛选
 criterion = nn.SmoothL1Loss(reduction="none")
 
+# 10. 获取训练总轮数（从train_config中读取，此处为40轮）
 num_epochs = train_config["num_epochs"]
 
-
-
+# 11. 获取分布式训练环境信息
+# global_rank：全局GPU编号（跨节点唯一，如2节点8卡，编号0-15）
+# rank：本地GPU编号（单节点内唯一，如0-7）
+# world_size：分布式训练总进程数（总GPU数量）
 global_rank = deepspeed.comm.get_rank()
 rank = deepspeed.comm.get_local_rank()
 world_size = deepspeed.comm.get_world_size()
+
+# 12. 仅主进程（global_rank=0）初始化WandB日志工具，避免多进程重复初始化
 if global_rank == 0:
     import wandb
 
@@ -363,85 +389,127 @@ if global_rank == 0:
         dir=wandb_dir
     )
 
+# 13. 创建模型保存目录，exist_ok=True：若目录已存在，不报错（避免重复创建导致的异常）
 os.makedirs(args.savedir, exist_ok=True)
 
+
+# 14. 构建测试集分布式采样器：保证多GPU间测试样本不重复
+# testdataset：测试数据集
+# num_replicas=world_size：总进程数（GPU数量）
+# rank=global_rank：当前进程全局编号
+# shuffle=False：测试集不打乱（保证验证结果可复现）
 sampler = DistributedSampler(testdataset, num_replicas=world_size, rank=global_rank, shuffle=False)
+# 15. 构建测试集数据加载器
+# batch_size=train_config["bs"]：单GPU批次大小
+# sampler=sampler：使用分布式采样器
+# num_workers=4：数据加载线程数（CPU多核加速）
+# pin_memory=True：锁定内存，提升CPU到GPU的数据传输速度
+# collate_fn=DataCollatorWithPadding：使用自定义数据拼接器，完成动态Padding
 test_loader = DataLoader(testdataset, batch_size=train_config["bs"], sampler=sampler, num_workers=4, pin_memory=True,
                          collate_fn=DataCollatorWithPadding())
-
+# 16. 构建训练集分布式采样器
+# traindataset：训练数据集
+# shuffle=True：训练集每轮打乱（提升模型泛化能力）
 train_sampler = DistributedSampler(traindataset, num_replicas=world_size, rank=global_rank, shuffle=True)
+# 17. 构建训练集数据加载器（参数含义同测试集）
 train_loader = DataLoader(traindataset, batch_size=train_config["bs"], sampler=train_sampler, num_workers=4,
                           pin_memory=True,
                           collate_fn=DataCollatorWithPadding())
 
-
+# 18. 自定义函数：查找最大编号的有效DeepSpeed检查点（用于断点续训）
+# directory：模型保存根目录
+# filename="zero_to_fp32.py"：DeepSpeed检查点的标识文件（存在该文件表示为有效检查点）
 def find_max_state_with_file(directory, filename="zero_to_fp32.py"):
-    max_a = -1
+    max_a = -1 # 初始化最大检查点编号为-1（表示未找到）
+    # 遍历模型保存目录下的所有子目录
     for subdir in os.listdir(directory):
+        # 正则匹配检查点目录名（格式：state_数字，如state_10）
         match = re.match(r"state_(\d+)", subdir)
         if match:
-            a_value = int(match.group(1))
-            subdir_path = os.path.join(directory, subdir)
-            file_path = os.path.join(subdir_path, filename)
+            a_value = int(match.group(1)) # 提取检查点编号（数字部分）
+            subdir_path = os.path.join(directory, subdir) # 检查点目录完整路径
+            file_path = os.path.join(subdir_path, filename) # 标识文件完整路径
+            # 判断：该路径是目录，且标识文件存在（有效检查点）
             if os.path.isdir(subdir_path) and os.path.exists(file_path):
                 max_a = max(max_a, a_value)
-    if max_a == -1:
+    if max_a == -1: # 未找到有效检查点
         return None, 0
+    # 返回最大有效检查点路径和下一个训练轮次（当前最大编号+1）
     return f"{directory}/state_{max_a}", max_a + 1
 
-
+# 19. 查找有效检查点，获取断点续训的起始轮次
 checkpoint_path, start_epoch = find_max_state_with_file(args.savedir)
+# 若找到有效检查点，加载模型权重和训练状态（优化器、轮次等）
 if checkpoint_path:
     print(f"load from {checkpoint_path}")
     model_engine.load_checkpoint(checkpoint_path)
 
 
-
+# 20. 核心训练循环：从起始轮次开始，遍历至总轮数
 for epoch in range(start_epoch, num_epochs):
+    # 为训练集采样器设置当前轮次：保证每轮训练样本打乱顺序不一致，提升模型泛化能力
     train_sampler.set_epoch(epoch+1)
     print(f"Now training epoch {epoch}")
 
-    model.train()
+    model.train() # 将模型切换为训练模式（启用Dropout、BatchNorm等训练特有层）
+    # 初始化epoch级别的精度和损失存储列表：按模型分层数量创建空列表（EAGLE模型分层输出，对应分层指标）
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
 
-
+    # 遍历训练集数据加载器，tqdm显示训练进度条
     for batch_idx, data in enumerate(tqdm(train_loader)):
 
-        model.zero_grad()
+        model.zero_grad() # 梯度清零：清除上一批次的梯度残留
 
+
+        # 前向传播：通过DeepSpeed模型引擎计算损失和精度
+        # input_ids/data["attention_mask"]：移至当前GPU（rank对应本地GPU编号）
+        # loss_mask：损失掩码（用于筛选参与损失计算的token）
+        # 返回值：plosses（分层预测损失）、vlosses（分层验证损失，此处未使用）、acces（分层精度）
         plosses, vlosses, acces = model_engine(input_ids=data["input_ids"].to(rank),
                                                attention_mask=data["attention_mask"].to(rank),
                                                loss_mask=data["loss_mask"],
                                                )
 
+        # 计算加权总损失：EAGLE模型特有，浅层损失权重更高（0.8的i次方，i为分层索引）
         ploss_weight = [0.8 ** i for i in range(len(plosses))]
         ploss = sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
-        loss = ploss
+        loss = ploss  # 最终训练损失（仅使用加权后的预测损失）
+        
+        # 反向传播：计算梯度（DeepSpeed封装，支持梯度累积、梯度裁剪）
         model_engine.backward(loss)
 
-
+        # 参数更新：根据梯度更新模型参数（DeepSpeed封装，支持学习率调度）
         model_engine.step()
-
+        
+        # 仅主进程记录批次级日志到WandB
         if global_rank == 0:
-            logdict = {"train/lr": optimizer.optimizer.param_groups[0]["lr"]}
+            logdict = {"train/lr": optimizer.optimizer.param_groups[0]["lr"]}  # 记录当前学习率
+            # 记录每一层的预测损失
             for i in range(len(plosses)):
                 logdict[f"train/ploss_{i}"] = plosses[i].item()
+            # 记录每一层的精度
             for i in range(len(acces)):
                 logdict[f"train/acc_{i}"] = acces[i]
-            wandb.log(logdict)
+            wandb.log(logdict)  # 上传日志到WandB
+
+        # 累积当前批次的精度和损失，用于后续计算epoch级指标
         epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
         epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
 
-
+    # 计算并记录epoch级训练精度（分布式全局平均）
     for i in range(len(epoch_acces)):
+        # 将当前进程的精度列表转为GPU张量，并计算均值
         acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
+        # 分布式全局聚合：所有GPU进程的精度求平均（ReduceOp.AVG：平均操作）
         deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
-        acc_i = acc_i.item()
+        acc_i = acc_i.item()  # 转为Python标量
+        # 仅主进程记录日志并打印
         if global_rank == 0:
             wandb.log({f"train/epochacc_{i}": acc_i})
             print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
 
+    # 计算并记录epoch级训练损失（分布式全局平均，逻辑同精度统计）
     for i in range(len(epoch_plosses)):
         loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
         deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
@@ -450,18 +518,23 @@ for epoch in range(start_epoch, num_epochs):
             wandb.log({f"train/epochploss_{i}": loss_i})
             print(f"Train Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
 
+    # 重置epoch级精度和损失列表，用于存储测试集指标
     epoch_acces = [[] for _ in range(model.length)]
     epoch_plosses = [[] for _ in range(model.length)]
 
+    # 遍历测试集数据加载器，进行验证（无梯度计算，节省显存）
     for batch_idx, data in enumerate(tqdm(test_loader)):
-        with torch.no_grad():
+        with torch.no_grad():  # 禁用梯度计算，提升验证速度，减少显存占用
+            # 前向传播：仅计算损失和精度，不进行反向传播
             plosses, vlosses, acces = model_engine(input_ids=data["input_ids"].to(rank),
                                                    attention_mask=data["attention_mask"].to(rank),
                                                    loss_mask=data["loss_mask"],
                                                    )
+            # 累积测试集批次指标
             epoch_acces = [epoch_acces[i] + [acces[i]] for i in range(len(acces))]
             epoch_plosses = [epoch_plosses[i] + [plosses[i].item()] for i in range(len(plosses))]
 
+    # 计算并记录epoch级测试精度（分布式全局平均，逻辑同训练集）
     for i in range(len(epoch_acces)):
         acc_i = torch.tensor(epoch_acces[i]).cuda().mean()
         deepspeed.comm.all_reduce(acc_i, op=deepspeed.comm.ReduceOp.AVG)
@@ -470,6 +543,7 @@ for epoch in range(start_epoch, num_epochs):
             wandb.log({f"test/epochacc_{i}": acc_i})
             print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i},  Acc: {acc_i:.2f}")
 
+    # 计算并记录epoch级测试损失（分布式全局平均，逻辑同训练集）
     for i in range(len(epoch_plosses)):
         loss_i = torch.tensor(epoch_plosses[i]).cuda().mean()
         deepspeed.comm.all_reduce(loss_i, op=deepspeed.comm.ReduceOp.AVG)
@@ -477,9 +551,14 @@ for epoch in range(start_epoch, num_epochs):
         if global_rank == 0:
             wandb.log({f"test/epochploss_{i}": loss_i})
             print(f"Test Epoch [{epoch + 1}/{num_epochs}], position {i}, pLoss: {loss_i:.2f}")
-    # clear out the redundance cahce after each step
+
+    # 清空GPU无用缓存：避免每轮训练/验证后显存累积，防止显存溢出
     torch.cuda.empty_cache()
 
+    # 保存16位精度模型：节省存储空间，兼容大部分部署场景
+    # f"{args.savedir}/state_{epoch}"：保存路径（按轮次命名，方便查找）
+    # exclude_frozen_parameters=True：排除冻结的模型参数（不保存无需更新的参数）
     model_engine.save_16bit_model(f"{args.savedir}/state_{epoch}", exclude_frozen_parameters=True)
+    # 每10轮保存一次完整DeepSpeed检查点：包含模型权重、优化器状态、训练轮次等，支持断点续训
     if epoch % 10 == 0:
         deepspeed.DeepSpeedEngine.save_checkpoint(model_engine, save_dir=f"{args.savedir}/state_{epoch}")
