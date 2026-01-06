@@ -27,7 +27,6 @@ export CUDA_VISIBLE_DEVICES="$GPU_ID"
 python3 -m eagle.evaluation.gen_ea_answer_llama3chat \
   --base-model-path "$BASE_MODEL_PATH" \
   --ea-model-path "$EA_MODEL_PATH" \
-  --use_eagle3 \
   --bench-name "$BENCH_NAME" \
   --answer-file "$ANSWER_FILE"
 

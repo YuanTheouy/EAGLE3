@@ -36,6 +36,8 @@ from safetensors import safe_open
 from datasets import load_dataset
 import multiprocessing
 
+
+# 创建因果掩码，用于自注意力机制
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
         input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0
@@ -53,7 +55,7 @@ def _make_causal_mask(
         mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
     return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
 
-
+# 扩展注意力掩码维度
 # Copied from transformers.models.bart.modeling_bart._expand_mask
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
@@ -68,7 +70,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
 
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
-
+# - 重复键值头，支持分组注意力
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -80,7 +82,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
-
+# 实现旋转位置编码的核心函数
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -88,53 +90,80 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
+# 核心旋转操作：拆分向量并翻转后一半
+def rotate_half(x):
+    """Rotates half the hidden dims of the input.
+    作用：将向量后一半维度取反，与前一半拼接，对应RoPE旋转公式中的 `-x2` 和 `x1`
+    """
+    x1 = x[..., : x.shape[-1] // 2]  # 前半部分维度
+    x2 = x[..., x.shape[-1] // 2:]   # 后半部分维度
+    return torch.cat((-x2, x1), dim=-1)
+
+# 应用RoPE到Q/K：结合cos/sin完成旋转
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
-    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
-    cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
-    sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
+    # 压缩cos/sin的冗余维度（预计算的前两维是1，无意义）
+    cos = cos.squeeze(1).squeeze(0)  # [max_seq_len, head_dim] → [seq_len, dim]
+    sin = sin.squeeze(1).squeeze(0)  # 同上
+    # 根据position_ids取对应位置的cos/sin，并扩展维度适配Q/K（增加head维度）
     cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+    sin = sin[position_ids].unsqueeze(1)  # 同上
+    # 核心RoPE计算：q*cos + 旋转后的q*sin
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
-
+# Llama风格的RoPE实现（核心类）
 class LlamaRotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
-
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
+        self.dim = dim  # 每个注意力头的维度（head_dim），比如64
+        self.max_position_embeddings = max_position_embeddings  # 最大序列长度，比如2048
+        self.base = base  # RoPE的基数，默认10000（论文值）
+        
+        # 步骤1：计算逆频率（inv_freq）——RoPE角度的核心参数
+        # 公式：inv_freq = 1 / (base ^ (2i / dim))，其中i是0,1,...,dim/2-1
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
+        # 注册为buffer：不参与梯度更新，但会被保存到模型中（persistent=False表示不持久化到磁盘）
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        # Build here to make `torch.jit.trace` work.
+        # 步骤2：预计算最大序列长度的cos/sin缓存（让torch.jit.trace能正常工作）
         self._set_cos_sin_cache(
             seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
         )
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
+        """预计算指定序列长度下所有位置的cos和sin值，存入缓存"""
+        self.max_seq_len_cached = seq_len  # 记录当前缓存的最大序列长度
+        # 生成位置索引：0,1,2,...,seq_len-1
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
 
+        # 步骤3：计算每个位置的频率（freqs）——位置t × 逆频率inv_freq
+        # einsum("i,j->ij")：等价于t.unsqueeze(1) @ inv_freq.unsqueeze(0)，生成[seq_len, dim/2]的矩阵
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        
+        # 步骤4：扩展频率到完整维度（dim）——因为之前只计算了dim/2个值，需要复制一份拼接
+        # 比如dim=64，freqs是[seq_len,32]，拼接后变成[seq_len,64]
         emb = torch.cat((freqs, freqs), dim=-1)
+        
+        # 步骤5：计算cos和sin，并增加前两维（为了适配后续的batch和head维度）
+        # emb.cos() → [seq_len, dim]，增加两维后→[1,1,seq_len,dim]
         self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
 
     def forward(self, x, seq_len=None):
-        # x: [bs, num_attention_heads, seq_len, head_size]
+        """前向传播：返回当前序列长度对应的cos/sin缓存"""
+        # x的shape：[bs, num_attention_heads, seq_len, head_size]
+        # 如果当前序列长度超过缓存的最大长度，重新计算缓存
         if seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
 
+        # 返回对应长度的cos/sin缓存（截断到当前seq_len），并匹配x的数据类型
         return (
             self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
         )
 
-
+# 线性缩放的 RoPE 实现
 class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
     """LlamaRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
 
@@ -153,7 +182,7 @@ class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
         self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
 
-
+# 动态 NTK 缩放的 RoPE，支持更长的上下文
 class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
     """LlamaRotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
 
@@ -180,7 +209,7 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
 
 
-
+# 适配缓存的自回归注意力机制（核心模块）
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -314,7 +343,7 @@ class LlamaAttention(nn.Module):
         new_past_key_value = [local_cache_k,local_cache_v]
         return attn_output, new_past_key_value
 
-
+# 草稿模型解码器的前馈网络层
 class LlamaMLP(nn.Module):
     def __init__(self, config, last=True):
         super().__init__()
@@ -352,7 +381,7 @@ class LlamaMLP(nn.Module):
 
         return down_proj
 
-
+# Llama 系列专用 RMS 归一化（无偏置，更稳定）
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -369,7 +398,7 @@ class LlamaRMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
-
+# 单层解码器（注意力 + MLP + 归一化，适配缓存逻辑）
 class LlamaDecoderLayeremb(nn.Module):
     def __init__(self, config, last=True):
         super().__init__()
@@ -444,7 +473,7 @@ class LlamaDecoderLayeremb(nn.Module):
 
         return outputs, latest_hidden_cache
 
-
+# 序列右移 / 左移（模拟自回归）；
 @torch.no_grad()
 def padding(tensor, left=True):
     zeropadding = torch.zeros_like(tensor[:, -1:])
@@ -454,7 +483,7 @@ def padding(tensor, left=True):
         tensor = torch.cat((tensor[:, 1:], zeropadding), dim=1)
     return tensor
 
-
+# 用于并行处理训练数据
 def process_data(data_chunk):
 
     token_dict = Counter()
@@ -469,7 +498,7 @@ def process_data(data_chunk):
 
     return token_dict
 
-
+# 用于并行处理训练数据
 def merge_dicts(dicts):
     """合并多个 Counter 字典"""
     result = Counter()
@@ -479,44 +508,65 @@ def merge_dicts(dicts):
 
 
 class Model(nn.Module):
+    # 初始化模型，加载与训练权重
     def __init__(self, config, ds_config, training_config, load_head=False, load_emb=True, path=None):
         super().__init__() 
         # self.layers = nn.ModuleList(
         #     [LlamaDecoderLayer(config, index=index) for index in range(config.num_hidden_layers)])
-        self.train_config = training_config
+        self.train_config = training_config # 训练配置参数
         # Settng dschf to allow efficient ZeRO-3 usage between hf and ds.
+        # 配置deepspeed zero3优化
         if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
             dschf = HfDeepSpeedConfig(ds_config)
         else:
             dschf = None
+        # 初始化核心解码层
         self.midlayer = LlamaDecoderLayeremb(config)
         # self.gradient_checkpointing = self.train_config.gradient_checkpointing
+        # 启用梯度检查点
         self.gradient_checkpointing = self.train_config["gradient_checkpointing"]
+        # 存储padding token索引，处理序列填充
         self.padding_idx = config.pad_token_id
+        # 原词汇大小
         self.vocab_size = config.vocab_size
+        # 模型隐藏层维度，由预训练模型决定
         self.hidden_size = config.hidden_size
+        # 草稿词汇表大小，从原词汇表筛选高频词而来，用于优化生成效率
         self.draft_vocab_size = config.draft_vocab_size
+        # 初始化 RMS 层归一化
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # 定义循环计数长度，模型中重复？？？
         self.length = 7
-        # self.target_model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
-        self.target_model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16)
+        self.target_model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
+        
+        # 加载与训练模型，作为特征提取器
+        # self.target_model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16)
+        # 设置为评估模式，不启用dropout
         self.target_model.eval()
+        # 定义全连接层，将3倍隐藏维度的输入压缩到隐藏维度，用于融合多层特征
         self.fc=nn.Linear(self.hidden_size*3, self.hidden_size, bias=False)
+
+        # 冻结目标模型的所有参数，不参与训练，仅作为固定特征提取器
         for param in self.target_model.parameters():
             param.requires_grad = False
 
+        # 初始化词嵌入层，根据load_emb参数均定是否加载预训练嵌入
         if not load_emb:
+            # 不加载预训练嵌入，随机初始化词嵌入层
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
 
         else:
-
+            # 加载预训练词嵌入权重，从指定路径与训练模型中读取
             from safetensors import safe_open
             import json
             import os
             try:
+                # 尝试从safetensors格式的文件中加载词嵌入
+                # 1、读取索引文件，找到词嵌入权重所在的文件名
                 with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
                     index_json = json.loads(f.read())
                     emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
+                # 2、从对应的safetensors文件中读取词嵌入权重
                 with safe_open(os.path.join(path, emb_path),
                                framework="pt",
                                device="cpu") as f:
@@ -524,533 +574,461 @@ class Model(nn.Module):
                     vocab_size, hidden_dim = tensor_slice.get_shape()
                     tensor = tensor_slice[:, :hidden_dim].float()
             except:
+                # 如果safetensors加载失败尝试从 pytorch_model.bin格式加载
+                # 1.读取索引文件，找到词嵌入权重所在的文件名
                 with open(os.path.join(path, "pytorch_model.bin.index.json"), "r") as f:
                     index_json = json.loads(f.read())
                     emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
+                # 2.从对应的bin文件中读取词嵌入权重
                 weights = torch.load(os.path.join(path, emb_path))
                 tensor = weights["model.embed_tokens.weight"].float()
+
+            # 用加载的预训练权重初始化词嵌入层
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx, _weight=tensor)
 
+        # 定义输出层，讲隐藏状态印社到草稿词汇表
         self.lm_head = nn.Linear(config.hidden_size, config.draft_vocab_size, bias=False)
 
+        # 冻结词嵌入层的参数，不参与训练，使用预训练的词向量
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
 
+    # 处理训练数据，构建草稿模型词汇表
     def scandata(self, datapath, tokenizerpath, cache_path="cache.pt"):
-        N = self.draft_vocab_size
+        N = self.draft_vocab_size  # 草稿模型的词汇表大小
         
+        # 检查缓存文件是否存在，若存在则验证缓存的词汇表大小是否匹配
         if os.path.exists(cache_path):
             try:
                 cache = torch.load(cache_path)
+                # 若缓存中的词汇表大小与当前模型配置的词汇表大小不匹配，则更新缓存路径
                 if cache["t2d"].shape[0] != self.vocab_size:
                     print(f"Cache vocab size mismatch ({cache['t2d'].shape[0]} vs {self.vocab_size}). using new cache path.")
                     cache_path = cache_path + f".{self.vocab_size}"
             except Exception as e:
                 print(f"Error checking cache: {e}")
 
+        # 若缓存文件不存在，则重新处理数据生成缓存
         if not os.path.exists(cache_path):
+            # 加载分词器
             tokenizer = AutoTokenizer.from_pretrained(tokenizerpath)
+            # 加载训练数据集（JSON格式）
             dataset = load_dataset('json', data_files=datapath)
-            dataset = dataset['train']
-            # dataset = dataset.select(range(96))
-            original_columns1 = dataset.column_names
-            # num_proc = 48
-            num_proc = 1
+            dataset = dataset['train']  # 获取训练集拆分
+            # dataset = dataset.select(range(96))  # 调试时可选取部分数据，此处注释掉
+            original_columns1 = dataset.column_names  # 记录原始数据集的列名，用于后续移除
+            # num_proc = 48  # 多进程处理数量，此处注释掉
+            num_proc = 1  # 当前使用1个进程处理
 
-
+            # 处理训练数据，生成训练样本的函数
             def preprocess_function(examples):
                 new_examples = {
-                    # "conversation": [],
-                    "input_ids": [],
-                    "loss_mask": []
+                    # "conversation": [],  # 可选：存储处理后的对话文本，此处注释掉
+                    "input_ids": [],  # 存储分词后的输入ID序列
+                    "loss_mask": []  # 存储损失掩码（标记哪些位置需要计算损失）
                 }
+                # 遍历每个样本
                 for i in range(len(examples['id'])):
+                    # 初始化对话消息列表，包含系统提示
                     messages = [
                         {"role": "system",
                          "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
                     ]
-                    convroles = ["user", "assistant"]
-                    roles = {"human": "user", "gpt": "assistant"}
-                    source = examples['conversations'][i]
+                    convroles = ["user", "assistant"]  # 对话角色的预期顺序
+                    roles = {"human": "user", "gpt": "assistant"}  # 原始角色到标准角色的映射
+                    source = examples['conversations'][i]  # 获取当前样本的对话内容
                     if not source:
-                        continue
+                        continue  # 跳过空对话
+                    # 若第一个发言者不是用户，则跳过该发言
                     if roles[source[0]["from"]] != "user":
-                        # Skip the first one if it is not from human
                         source = source[1:]
+                    # 遍历对话内容，构建消息列表
                     for j, sentence in enumerate(source):
                         role = roles[sentence["from"]]
+                        # 验证对话角色顺序是否符合预期（用户-助手交替）
                         assert role == convroles[j % 2], f"{i}"
-                        # if sentence["from"]=="gpt":
-                        #     sentence["value"]=" "+sentence["value"]
+                        # 添加当前发言到消息列表
                         messages.append(
                             {"role": role, "content": sentence["value"]}
                         )
+                    # 将消息列表转换为模型可处理的对话字符串（应用聊天模板）
                     conversation = tokenizer.apply_chat_template(
                         messages,
                         tokenize=False,
                         add_generation_prompt=False,
                     )
 
+                    # 若未设置pad_token_id，则使用unk_token_id作为填充符
                     if not tokenizer.pad_token_id:
                         tokenizer.pad_token_id = tokenizer.unk_token_id
 
+                    # 对对话字符串进行分词，获取输入ID
                     input_ids = tokenizer(
                         conversation,
                         return_tensors="pt",
                         add_special_tokens=False,
                     ).input_ids[0]
-                    # When construct draft model vocab, 
-                    # filter out samples which is longer than max_len,
-                    # instead of truncating them.
+                    # 构建草稿模型词汇表时，过滤掉长度超过最大长度的样本（不截断）
                     if len(input_ids) > self.train_config["max_len"]:
                         continue
+                    # 初始化损失掩码为全1（默认所有位置都计算损失）
                     loss_mask = torch.ones_like(input_ids)
-                    # print(i)
+                    # print(i)  # 调试用，此处注释掉
 
-                    # sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                    # 定义对话分隔符（用于区分不同轮次的用户和助手发言）
+                    # sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"  # 旧分隔符，注释掉
+                    # sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"  # 旧分隔符，注释掉
+                    sep = "<|im_start|>assistant"  # 助手发言起始标记
+                    total_len = len(input_ids)  # 输入序列总长度
+                    sep2 = "<|im_start|>user"  # 用户发言起始标记
 
-                    # total_len = len(input_ids)
-
-                    # sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
-
-
-                    sep = "<|im_start|>assistant"
-
-                    total_len = len(input_ids)
-
-                    sep2 = "<|im_start|>user"
-
+                    # 按用户发言标记分割对话，区分不同轮次
                     turns = conversation.split(sep2)
 
-                    # print("渲染后的对话：", conversation)
-                    # print("sep2是否存在：", sep2 in conversation)
+                    # print("渲染后的对话：", conversation)  # 调试用，注释掉
+                    # print("sep2是否存在：", sep2 in conversation)  # 调试用，注释掉
+                    # 若轮次少于2，则跳过（至少需要一轮用户和一轮助手发言）
                     if len(turns) < 2:
                         continue  # 或者根据需求处理，例如记录日志后跳过
 
+                    # 还原第一轮分割丢失的用户标记
                     turns[1] = turns[0] + sep2 + turns[1]
-                    turns = turns[1:]
+                    turns = turns[1:]  # 保留有效轮次
 
+                    # 初始化当前长度指针，用于标记损失掩码的位置
                     cur_len = 1
-                    loss_mask[:cur_len] = 0
+                    loss_mask[:cur_len] = 0  # 忽略起始位置的损失
+                    # 遍历每轮对话，更新损失掩码（忽略用户输入部分，只关注助手输出部分）
                     for i, turn in enumerate(turns):
                         if turn == "":
-                            break
+                            break  # 跳过空轮次
+                        # 计算当前轮次的长度（分词后）
                         turn_len = len(tokenizer(turn).input_ids)
 
+                        # 按助手标记分割当前轮次，区分用户输入和助手输出
                         parts = turn.split(sep)
                         if len(parts) != 2:
-                            break
-                        parts[0] += sep
-                        # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
+                            break  # 格式不符合预期则跳过
+                        parts[0] += sep  # 还原分割丢失的助手标记
+                        # 计算指令部分（用户输入）的长度（减1是为了修正偏移）
                         instruction_len = len(tokenizer(parts[0]).input_ids) - 1
 
-                        # Ignore the user instructions
+                        # 忽略用户指令部分的损失（不计算模型对用户输入的预测损失）
                         if i == 0:
                             loss_mask[cur_len: cur_len + instruction_len - 2] = 0
                         else:
                             loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
+                        # 更新当前长度指针
                         cur_len += turn_len
                         if i != 0:
                             cur_len += 3
-                        # cur_len+=2
+                        # cur_len+=2  # 备用长度调整，注释掉
 
                         # if i != 0 and not tokenizer.legacy:
-                        #     # The legacy and non-legacy modes handle special tokens differently
+                        #     # 旧版和新版分词器对特殊标记的处理不同，可能需要调整长度
                         #     cur_len -= 1
 
+                    # 忽略超出当前轮次的部分（后续内容）的损失
                     loss_mask[cur_len:] = 0
 
-                    # new_examples["conversation"].append(conversation)
-                    new_examples["input_ids"].append(input_ids[None, :])
-                    new_examples["loss_mask"].append(loss_mask[None, :])
+                    # new_examples["conversation"].append(conversation)  # 可选：存储对话文本，注释掉
+                    new_examples["input_ids"].append(input_ids[None, :])  # 添加输入ID（增加 batch 维度）
+                    new_examples["loss_mask"].append(loss_mask[None, :])  # 添加损失掩码（增加 batch 维度）
 
                 return new_examples
-            # def preprocess_function(examples):
-            #     new_examples = {
-            #         "input_ids": [],
-            #         "loss_mask": []
-            #     }
-                
-            #     # 定义角色映射，防止出现 KeyError
-            #     roles_map = {"human": "user", "gpt": "assistant", "system": "system", "user": "user", "assistant": "assistant"}
-                
-            #     for i in range(len(examples['id'])):
-            #         try:
-            #             source = examples['conversations'][i]
-            #             if not source:
-            #                 continue
+            
 
-            #             # --- 1. 寻找第一个 User 发言 ---
-            #             # 跳过开头可能的 system prompt 或其他非 user 内容
-            #             start_idx = -1
-            #             for idx, sent in enumerate(source):
-            #                 role_label = sent.get("from", "")
-            #                 if roles_map.get(role_label, "") == "user":
-            #                     start_idx = idx
-            #                     break
-                        
-            #             if start_idx == -1:
-            #                 # 没找到 User 发言，该样本无效，跳过
-            #                 continue
-                            
-            #             source = source[start_idx:]
-                        
-            #             # --- 2. 验证对话轮次交替 (User -> Assistant -> User ...) ---
-            #             # 构建 clean_messages
-            #             messages = [
-            #                 {"role": "system", "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
-            #             ]
-                        
-            #             valid_sample = True
-            #             expected_role = "user"
-                        
-            #             temp_msgs = []
-            #             for sentence in source:
-            #                 role_key = sentence.get("from", "")
-            #                 role = roles_map.get(role_key, "unknown")
-                            
-            #                 # 如果遇到无法识别的角色，认为样本脏了
-            #                 if role == "unknown":
-            #                     valid_sample = False
-            #                     break
-                                
-            #                 # 简单的交替检查：
-            #                 # 如果当前是 user，下一句期望是 assistant
-            #                 # 如果当前是 assistant，下一句期望是 user
-            #                 # (忽略 system，但在 Eagle 这种训练里通常只有 U/A)
-                            
-            #                 if role != expected_role:
-            #                     # 发现顺序不对（例如连续两个 user），丢弃该样本
-            #                     valid_sample = False
-            #                     break
-                            
-            #                 temp_msgs.append({"role": role, "content": sentence["value"]})
-                            
-            #                 # 翻转期望角色
-            #                 if expected_role == "user":
-            #                     expected_role = "assistant"
-            #                 else:
-            #                     expected_role = "user"
-                        
-            #             if not valid_sample or len(temp_msgs) == 0:
-            #                 continue
-                            
-            #             messages.extend(temp_msgs)
-
-            #             # --- 3. 生成对话并 Tokenize ---
-            #             conversation = tokenizer.apply_chat_template(
-            #                 messages,
-            #                 tokenize=False,
-            #                 add_generation_prompt=False,
-            #             )
-                        
-            #             # 强制修正换行符，确保后续 split 正常
-            #             target_sep_pattern = "<|start_header_id|>assistant<|end_header_id|>"
-            #             conversation = conversation.replace(target_sep_pattern + "\n", target_sep_pattern + "\n\n")
-
-            #             if not tokenizer.pad_token_id:
-            #                 tokenizer.pad_token_id = tokenizer.unk_token_id
-
-            #             input_ids = tokenizer(
-            #                 conversation,
-            #                 return_tensors="pt",
-            #                 add_special_tokens=False,
-            #             ).input_ids[0]
-
-            #             if len(input_ids) > self.train_config["max_len"]:
-            #                 continue
-                            
-            #             loss_mask = torch.ones_like(input_ids)
-                        
-            #             # --- 4. 计算 Mask (使用切分法) ---
-            #             # 定义分隔符 (注意：这里不要硬编码 \n\n 在 split 里，除非你上面做了强制替换)
-            #             # 为了保险，我们用 Tag 切分
-            #             sep_tag = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>" 
-                        
-            #             # 你的代码逻辑原本依赖 \n\n，这里为了兼容你的逻辑，我们假设上面 replace 成功了
-            #             # 或者我们调整 split 逻辑
-                        
-            #             # 这里我们沿用你原本的思路，但做防御
-            #             sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-            #             sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
-                        
-            #             turns = conversation.split(sep2)
-                        
-            #             if len(turns) < 2:
-            #                 continue
-
-            #             turns[1] = turns[0] + sep2 + turns[1]
-            #             turns = turns[1:]
-
-            #             cur_len = 1
-            #             loss_mask[:cur_len] = 0
-                        
-            #             for k, turn in enumerate(turns):
-            #                 if turn == "":
-            #                     break
-                            
-            #                 turn_len = len(tokenizer(turn).input_ids)
-                            
-            #                 parts = turn.split(sep)
-            #                 if len(parts) != 2:
-            #                     # 切分失败，说明模板格式不对，跳过
-            #                     break
-                                
-            #                 parts[0] += sep
-            #                 # -2 是针对 Llama3 tokenizer 的魔术数字，需谨慎
-            #                 instruction_len = len(tokenizer(parts[0]).input_ids) - 1
-
-            #                 if k == 0:
-            #                     loss_mask[cur_len: cur_len + instruction_len - 2] = 0
-            #                 else:
-            #                     loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
-                                
-            #                 cur_len += turn_len
-            #                 if k != 0:
-            #                     cur_len += 3
-
-            #             loss_mask[cur_len:] = 0
-
-            #             new_examples["input_ids"].append(input_ids[None, :])
-            #             new_examples["loss_mask"].append(loss_mask[None, :])
-                    
-            #         except Exception as e:
-            #             # 捕获所有异常，打印一下但不中断训练
-            #             # print(f"Skipping sample {i} due to error: {e}")
-            #             continue
-
-            #     return new_examples
-
+            # 应用预处理函数到数据集
             dataset = dataset.map(
                 preprocess_function,
-                batched=True,
-                # num_proc=num_proc,
-                num_proc=1,
-                remove_columns=original_columns1,
-                load_from_cache_file=False
+                batched=True,  # 批量处理样本
+                # num_proc=num_proc,  # 多进程处理，注释掉
+                num_proc=1,  # 使用1个进程
+                remove_columns=original_columns1,  # 移除原始列
+                load_from_cache_file=False  # 不加载缓存文件（强制重新处理）
             )
-            #dataset.set_format(type="torch")
+            # dataset.set_format(type="torch")  # 可选：设置数据集格式为torch，注释掉
 
 
-
-            num_processes = num_proc
+            # 准备多进程处理数据块（统计token频率）
+            num_processes = num_proc  # 进程数量
+            # 计算每个进程处理的数据块大小
             chunk_size = len(dataset) // num_processes + (len(dataset) % num_processes > 0)
+            # 将数据集分割为多个数据块
             chunks = [dataset[i:i + chunk_size] for i in range(0, len(dataset), chunk_size)]
 
             # 创建进程池
             with multiprocessing.Pool(num_processes) as pool:
-                # 并行处理数据块
+                # 并行处理每个数据块，统计token频率
                 results = pool.map(process_data, chunks)
 
-            # 合并结果
+            # 合并所有进程的统计结果
             token_dict = merge_dicts(results)
 
 
+            # 计算总token出现次数
             total_frequency = sum(token_dict.values())
+            # 获取出现频率最高的N个token
             top_N = token_dict.most_common(N)
+            # 计算top N token的总频率
             top_N_frequency_sum = sum(freq for key, freq in top_N)
+            # 计算top N token的频率占比
             top_N_ratio = top_N_frequency_sum / total_frequency
             print(f"top {N} token frequency ratio: {top_N_ratio:.2%}")
+            # 提取top N token的ID并排序
             used_tokens = [key for key, freq in top_N]
             used_tokens.sort()
+            # 构建草稿词表到原始词表的映射（d2t）和原始词表到草稿词表的映射（t2d）
             d2t = [used_tokens[i] - i for i in range(len(used_tokens))]
             t2d = [i in used_tokens for i in range(self.vocab_size)]
+            # 转换为张量
             d2t = torch.tensor(d2t)
             t2d = torch.tensor(t2d)
+            # 构建缓存字典
             cache = {
                 "d2t": d2t,
                 "t2d": t2d
             }
+            # 保存缓存到文件
             torch.save(cache, "cache.pt")
         else:
+            # 若缓存存在，则直接加载缓存
             cache = torch.load("cache.pt")
             d2t = cache["d2t"]
             t2d = cache["t2d"]
+        # 将映射关系注册为缓冲区（随模型保存，不参与梯度计算）
         self.register_buffer("d2t", d2t)
         self.register_buffer("t2d", t2d)
+        # 初始化平滑L1损失函数（用于后续训练）
         self.l1smooth = nn.SmoothL1Loss(reduction="none")
 
+    # 准备解码器注意力掩码
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
-        # create causal mask
-        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        # 创建因果掩码（用于防止未来信息泄露，确保每个位置只能关注自身及之前的位置）
+        # 形状从 [批次大小, 序列长度] 转换为 [批次大小, 1, 目标序列长度, 源序列长度]
         combined_attention_mask = None
+        # 当序列长度大于1时才需要创建因果掩码（长度为1时无需掩码）
         if input_shape[-1] > 1:
             combined_attention_mask = _make_causal_mask(
-                input_shape,
-                inputs_embeds.dtype,
-                device=inputs_embeds.device,
-                past_key_values_length=past_key_values_length,
+                input_shape,                  # 输入序列的形状
+                inputs_embeds.dtype,          # 数据类型（与输入嵌入保持一致）
+                device=inputs_embeds.device,  # 设备（与输入嵌入保持一致）
+                past_key_values_length=past_key_values_length,  # 历史键值对的长度（用于增量解码）
             )
 
+        # 如果提供了注意力掩码（通常用于屏蔽填充位置）
         if attention_mask is not None:
-            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            # 将注意力掩码从 [批次大小, 序列长度] 扩展为 [批次大小, 1, 目标序列长度, 源序列长度]
             expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]).to(
-                inputs_embeds.device
+                inputs_embeds.device  # 转移到与输入嵌入相同的设备
             )
+            # 合并因果掩码和填充掩码（如果两者都存在则相加）
             combined_attention_mask = (
                 expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
             )
 
         return combined_attention_mask
 
-    @torch.no_grad()
+    # 预处理输入数据，获取目标模型的隐藏状态
+    @torch.no_grad()  # 禁用梯度计算，节省内存并加速计算（因为目标模型参数不参与训练）
     def dataprepare(self, input_ids, attention_mask, loss_mask):
-        device = input_ids.device
-        # ADDED: output_hidden_states=True
+        device = input_ids.device  # 获取输入数据所在的设备
+        # 调用目标模型，输出包含隐藏状态（设置output_hidden_states=True以获取中间层输出）
         outs = self.target_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        # 获取前三层的隐藏状态（用于后续特征融合）
         hidden_states0 = outs.hidden_states[0]
         hidden_states1 = outs.hidden_states[1]
         hidden_states2 = outs.hidden_states[2]
-        hidden_states=torch.cat((hidden_states0,hidden_states1,hidden_states2),dim=-1)
-        # hidden_states=torch.cat((hidden_states0,hidden_states1),dim=-1)
+        # 将三层隐藏状态在最后一个维度拼接（融合多层特征）
+        hidden_states = torch.cat((hidden_states0, hidden_states1, hidden_states2), dim=-1)
+        # hidden_states=torch.cat((hidden_states0,hidden_states1),dim=-1)  # 备用：仅拼接前两层
+        
+        # 获取目标模型的输出logits（用于计算损失）
         target = outs.logits
+        # 对目标logits进行右移（使每个位置预测下一个token），left=False表示向右填充
         target = padding(target, left=False)
+        # 对输入ID进行右移（与目标logits对齐）
         input_ids = padding(input_ids, left=False)
 
+        # 如果目标logits存在，进行设备对齐和损失掩码处理
         if target is not None:
-            target = target.to(device)
-            loss_mask = loss_mask[..., None]
-            loss_mask = loss_mask.to(device)
+            target = target.to(device)  # 确保目标在正确的设备上
+            loss_mask = loss_mask[..., None]  # 增加一个维度，便于广播
+            loss_mask = loss_mask.to(device)  # 确保损失掩码在正确的设备上
 
         return hidden_states, target, loss_mask, input_ids
 
+    # 模型前向传播，实现迭代生成和损失计算
     def forward(
             self,
-            # hidden_states,
-            input_ids,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            loss_mask: Optional[torch.Tensor] = None,
-
+            input_ids,  # 输入的token ID序列 输入的，经过tokenizer的整数序列
+            attention_mask: Optional[torch.Tensor] = None,  # 注意力掩码（用于屏蔽填充位置）
+            position_ids: Optional[torch.LongTensor] = None,  # 位置ID（用于位置编码），记录每一个token的位置信息，解决transformer模型无法感知token的顺序问题
+            past_key_values: Optional[List[torch.FloatTensor]] = None,  # 历史键值对缓存（用于增量解码）
+            use_cache: Optional[bool] = None,  # 是否使用缓存（用于加速生成）
+            output_attentions: Optional[bool] = None,  # 是否输出注意力权重，输出序列中对输入不同token的关注程度
+            output_hidden_states: Optional[bool] = None,  # 是否输出隐藏状态，模型返回每一层的隐藏状态
+            loss_mask: Optional[torch.Tensor] = None,  # 损失掩码（标记需要计算损失的位置）
     ):
+        # 预处理输入数据，获取目标模型的隐藏状态、目标logits、损失掩码和处理后的输入ID
+        # target 是 inputs_ids 右移一位的结果，模型输出的logits是预测下一个token的概率分布，与target进行比较，比如交叉墒损失
         hidden_states, target, loss_mask, input_ids = self.dataprepare(input_ids, attention_mask, loss_mask)
 
+        # 获取批量大小和序列长度
         batch_size, seq_length, _ = hidden_states.shape
-        seq_length_with_past = seq_length
-        past_key_values_length = 0
+        seq_length_with_past = seq_length  # 包含历史缓存的总序列长度（初始为当前序列长度）
+        past_key_values_length = 0  # 历史键值对的长度（初始为0）
 
+        # 以下代码注释：原本用于获取输入嵌入，但当前实现中已通过目标模型获取隐藏状态
         # with torch.no_grad():
         #     inputs_embeds = self.embed_tokens(input_ids)
         #     inputs_embeds = inputs_embeds.detach()
 
+        # 如果处于训练模式且启用梯度检查点，确保隐藏状态需要梯度
         if self.training and self.gradient_checkpointing and not hidden_states.requires_grad:
             hidden_states.requires_grad = True
 
-        hidden_states=self.fc(hidden_states)
+        # 通过全连接层将融合的三层隐藏状态压缩到模型隐藏维度
+        hidden_states = self.fc(hidden_states)
 
+        hidden_merge_states = self.fc(hidden_states)
+        if self.training and self.gradient_checkpointing and not hidden_states.requires_grad:
+            hidden_merge_states.requires_grad = True
+
+
+        # 如果存在历史键值对缓存，更新总序列长度
         if past_key_values is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
-            seq_length_with_past = seq_length_with_past + past_key_values_length
+            past_key_values_length = past_key_values[0][0].shape[2]  # 历史序列长度
+            seq_length_with_past = seq_length_with_past + past_key_values_length  # 总序列长度 = 当前长度 + 历史长度
+
+        # 如果未提供位置ID，则自动生成（从历史长度开始到总长度）
         if position_ids is None:
-            device = hidden_states.device
+            device = hidden_states.device  # 获取设备
             position_ids = torch.arange(
                 past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
             )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)  # 调整形状为 [批次大小, 序列长度]
         else:
-            position_ids = position_ids.view(-1, seq_length).long()
+            position_ids = position_ids.view(-1, seq_length).long()  # 确保形状正确
 
+        # 如果未提供注意力掩码，则创建全1掩码（所有位置都不被屏蔽）
         if attention_mask is None:
             attention_mask = torch.ones(
                 (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
             )
+        
+        # 准备解码器注意力掩码（融合因果掩码和填充掩码）
         attention_mask = self._prepare_decoder_attention_mask(
             attention_mask, (batch_size, seq_length), hidden_states, past_key_values_length
         )
 
+        # 如果启用梯度检查点且处于训练模式，禁用缓存（梯度检查点与缓存不兼容）
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 use_cache = False
 
-        plosses = []
-        vlosses = []
-        acces = []
-        cache_hidden = [[], []]
+        # 初始化损失、准确率等记录列表
+        plosses = []  # 存储每个迭代步骤的预测损失
+        vlosses = []  # 预留：可用于存储验证损失
+        acces = []    # 存储每个迭代步骤的准确率
+        cache_hidden = [[], []]  # 存储隐藏状态缓存（键缓存和值缓存）
 
+        # 进行多步迭代生成（迭代次数由self.length指定）
         for idx in range(self.length):
-            last = idx == self.length - 1
+            last = idx == self.length - 1  # 判断是否为最后一次迭代
+            # 将输入ID转换为嵌入向量
             inputs_embeds = self.embed_tokens(input_ids)
+            # 如果处于训练模式且启用梯度检查点，确保输入嵌入需要梯度
             if self.training and self.gradient_checkpointing and not inputs_embeds.requires_grad:
                 inputs_embeds.requires_grad = True
+            # 确保输入嵌入的数据类型与隐藏状态一致
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
+            # 如果启用梯度检查点且处于训练模式，使用检查点机制节省内存
             if self.gradient_checkpointing and self.training:
 
+                # 定义自定义前向函数（用于梯度检查点）
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
-                        # None for past_key_value
+                        # 调用模块时不传入past_key_value（因为使用缓存机制不同）
                         return module(*inputs, None, output_attentions)
 
                     return custom_forward
 
+                # 使用梯度检查点计算当前层输出
                 layer_outputs, cache_hidden = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(self.midlayer),
-                    inputs_embeds,
-                    hidden_states,
-                    cache_hidden,
-                    attention_mask,
-                    position_ids,
+                    create_custom_forward(self.midlayer),  # 自定义前向函数
+                    inputs_embeds,                        # 输入嵌入
+                    hidden_states,                        # 隐藏状态
+                    cache_hidden,                         # 缓存的隐藏状态
+                    attention_mask,                       # 注意力掩码
+                    position_ids,                         # 位置ID
                 )
             else:
-
+                # 正常计算当前层输出（不使用梯度检查点）
                 layer_outputs, cache_hidden = self.midlayer(
-                    input_emb=inputs_embeds,
-                    hidden_states=hidden_states,
-                    cache_hidden=cache_hidden,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=None,
-                    output_attentions=output_attentions,
-                    use_cache=True,
+                    input_emb=inputs_embeds,             # 输入嵌入
+                    hidden_states=hidden_states,         # 隐藏状态
+                    cache_hidden=cache_hidden,           # 缓存的隐藏状态
+                    attention_mask=attention_mask,       # 注意力掩码
+                    position_ids=position_ids,           # 位置ID
+                    past_key_value=None,                 # 不使用历史键值对（当前实现使用cache_hidden）
+                    output_attentions=output_attentions, # 是否输出注意力权重
+                    use_cache=True,                      # 使用缓存
                 )
 
+            # 获取当前层的输出隐藏状态
             hidden_states_out = layer_outputs[0]
-            # cache_hidden.append(layer_outputs[1])
-            # kv_cahce = layer_outputs[-1]
 
+            # 在无梯度计算的上下文下，处理目标模型的输出用于损失计算
             with torch.no_grad():
-                # hidden_states_target = padding(hidden_states, left=False)
+                # target_head = target  # 目标logits（已右移）
                 target_head = target
+                # 获取目标logits中概率最大的token（作为真实标签）
                 target_max_token = target_head.argmax(-1)
-                # Move d2t to the same device as target_max_token
+                # 将token映射表t2d转移到与目标token相同的设备
                 self.t2d = self.t2d.to(target_max_token.device)
+                # 根据映射表生成目标掩码（标记哪些token在草稿词汇表中）
                 target_mask = self.t2d[target_max_token]
-                target_mask = target_mask[..., None].int()
+                target_mask = target_mask[..., None].int()  # 增加维度便于广播
+                # 结合目标掩码和损失掩码（只关注需要计算损失且在草稿词汇表中的位置）
                 position_mask = target_mask * loss_mask
+                # 将目标logits映射到草稿词汇表
                 target_head = target_head[..., self.t2d]
-                target_head = target_head.float()
+                target_head = target_head.float()  # 转换为float类型
+                # 计算目标概率分布（应用softmax）
                 target_p = nn.Softmax(dim=2)(target_head)
-                target_p = target_p.detach()
+                target_p = target_p.detach()  #  detach目标概率，避免对目标模型求导
 
-
-
+            # 更新隐藏状态为当前层的输出
             hidden_states = hidden_states_out
 
+            # 对输出隐藏状态进行归一化
             hidden_states_out = self.norm(hidden_states_out)
 
+            # 通过输出层计算草稿模型的logits
             logits = self.lm_head(hidden_states_out)
-            logits = logits.float()
+            logits = logits.float()  # 转换为float类型
+            # 计算log概率（应用log_softmax）
             out_logp = nn.LogSoftmax(dim=2)(logits)
+            # 计算预测概率与目标概率的交叉熵（仅在有效位置）
             plogp = target_p * out_logp
             loss = -torch.sum(position_mask * plogp, 2).mean()
-            plosses.append(loss)
-            with torch.no_grad():
-                acces.append(((logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)).sum().item() / (
-                        loss_mask.sum().item() + 1e-6))
+            plosses.append(loss)  # 记录当前步骤的损失
 
+            # 在无梯度计算的上下文下，计算当前步骤的准确率
+            with torch.no_grad():
+                # 计算预测正确的token数（在有效位置上）并除以总有效token数
+                acces.append(((logits.argmax(-1) == target_p.argmax(-1)) * position_mask.squeeze(-1)).sum().item() / (
+                        loss_mask.sum().item() + 1e-6))  # 加1e-6避免除零错误
+
+            # 如果不是最后一次迭代，对输入、目标和损失掩码进行右移（准备下一次迭代）
             if not last:
                 input_ids = padding(input_ids, left=False)
                 target = padding(target, left=False)
                 loss_mask = padding(loss_mask, left=False)
 
-
-
+        # 返回所有迭代步骤的损失、预留的验证损失和准确率
         return plosses, vlosses, acces
-
-
 
 

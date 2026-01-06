@@ -1,4 +1,4 @@
-"""Generate answers with local models."""
+"""Generate answers with Qwen2.5B model."""
 
 import argparse
 import json
@@ -8,15 +8,13 @@ import torch
 import shortuuid
 from tqdm import tqdm
 from accelerate.utils import set_seed
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # 固定随机种子（保证可复现）
 set_seed(0)
 
 # 第三方工具导入
 from fastchat.llm_judge.common import load_questions
-
-# Eagle3核心模块（只保留Eagle3相关）
-from eagle.model.ea_model import EaModel
 
 SYSTEM_PROMPT = (
     "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."
@@ -32,8 +30,7 @@ SYSTEM_PROMPT = (
     6. 对答案文件去重+按question_id排序
 '''
 def run_eval(
-        base_model_path,
-        ea_model_path,
+        model_path,
         model_id,
         question_file,
         question_begin,
@@ -63,14 +60,13 @@ def run_eval(
         get_answers_func = get_model_answers
 
     # 4. 拆分问题：按chunk_size将问题分成多块，每块分配给一个GPU/进程
-    chunk_size = len(questions) // (num_gpus_total // num_gpus_per_model)  # // 2
+    chunk_size = len(questions) // (num_gpus_total // num_gpus_per_model)
     ans_handles = [] # 存储Ray远程任务句柄（用于后续等待任务完成）
     for i in range(0, len(questions), chunk_size): # 按chunk_size遍历问题列表，分块调用生成函数
         ans_handles.append(
             # 每块问题调用一次生成函数
             get_answers_func(
-                base_model_path,
-                ea_model_path,
+                model_path,
                 model_id,
                 questions[i: i + chunk_size], # 本次进程处理的问题块
                 answer_file,
@@ -89,11 +85,10 @@ def run_eval(
 
 
 # 模型初始化 + 生成答案
-# 这是代码最核心的部分，负责模型加载、预热、逐问题生成答案，可拆分为 3 个子步骤
+# 适配Qwen2.5B的核心逻辑
 @torch.inference_mode()
 def get_model_answers(
-        base_model_path,
-        ea_model_path,
+        model_path,
         model_id,
         questions,
         answer_file,
@@ -105,84 +100,100 @@ def get_model_answers(
         args
     ):
     # 单轮对话生成，适用于warmup和正式推理
-    def generate_single_turn(message, tokenizer, model, temperature):
+    def generate_single_turn(messages, tokenizer, model, temperature):
         """
-        复用的核心生成函数：处理单轮对话的prompt构造、生成、解码清理
-        返回：生成的文本、新token数、idx、耗时
+        Qwen2.5B适配的核心生成函数：处理单轮对话的prompt构造、生成、解码清理
+        返回：生成的文本、新token数、idx（兼容原字段）、耗时
         """
-        # 1、构造prompt并编码
-        prompt = tokenizer.apply_chat_template( # 需要给我好好讲讲这个的意思？？
-            messages, tokenize = False, add_generation_prompt = True
+        # 1、构造prompt并编码（适配Qwen的chat_template）
+        prompt = tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True,
+            padding=False,
+            truncation=False
         )
-        input_ids = tokenizer([prompt],add_special_tokens=False,).input_ids ## 这个又是咋构建的？？？
+        # 编码为input_ids（Qwen2.5B标准方式）
+        inputs = tokenizer(
+            [prompt],
+            add_special_tokens=False,
+            return_tensors="pt"
+        ).to(model.device)
+        
         # 2、模型生成（计时）
         torch.cuda.synchronize()
         start_time = time.time()
-        output_ids,new_token,idx = model.naivegenerate( # 为什么又分别给这些东西了？？
-            torch.as_tensor(input_ids).cuda(),
-            temperature=temperature,
-            log=True,
-            is_llama3=True,
+        # Qwen2.5B标准生成接口（替换原naivegenerate）
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_token,
+            temperature=temperature if temperature > 1e-5 else 1e-5,
+            top_p=0.95,
+            do_sample=temperature > 1e-5,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
         )
         torch.cuda.synchronize()
         total_time = time.time() - start_time
-        # 3、解码+清理特殊字典
-        output_ids = output_ids[0][len(input_ids[0]):] ###为什么这样搞？？
-        stop_token_ids = [ # 这个又是什么？？
-            tokenizer.eos_token_id,
-            tokenizer.convert_tokens_to_ids("<|eot_id|>")
-        ]
+        
+        # 3、解码+清理特殊token
+        # 只取生成的新token（去掉输入部分）
+        output_ids = outputs[0][len(inputs.input_ids[0]):]
+        # Qwen2.5B停止符处理
+        stop_token_ids = [tokenizer.eos_token_id]
         if stop_token_ids:
             stop_idx = [i for i, id in enumerate(output_ids) if id in stop_token_ids]
             if stop_idx:
                 output_ids = output_ids[: stop_idx[0]]
+        
         # 解码文本
         output = tokenizer.decode(
             output_ids,
-            spaces_between_special_tokens=False,
+            skip_special_tokens=True,
+            spaces_between_special_tokens=False
         )
-        # 清理所有特殊token
-        for tok in tokenizer.special_tokens_map.values():
-            if isinstance(tok, list):
-                for special_tok in tok:
-                    output = output.replace(special_tok, "")
-            else:
-                output = output.replace(tok, "")
-        output = output.strip() ## 这是不是有必要，毕竟你的里面没写
+        output = output.strip()
+        
+        # 兼容原返回格式（idx设为0，new_token为生成的token数）
+        new_token = len(output_ids)
+        idx = 0
         return output, new_token, idx, total_time
 
-    # 初始化EaModel（Eagle3封装类，集成基础模型+加速策略）
-    model = EaModel.from_pretrained(
-        base_model_path=base_model_path,
-        ea_model_path=ea_model_path,
-        total_token=args.total_token,
-        depth=args.depth,
-        top_k=args.top_k,
+    # 初始化Qwen2.5B模型和Tokenizer（核心适配）
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        padding_side="right"
+    )
+    # 设置默认pad token（Qwen2.5B可能未默认设置）
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
-        load_in_8bit=False,
-        device_map="auto"
+        device_map="auto",
+        max_memory={i: max_gpu_memory for i in range(torch.cuda.device_count())}
     )
-    tokenizer = model.get_tokenizer()
-    model.eval() # 模型设为评估模式（禁用Dropout等训练层，保证推理稳定）
+    model.eval() # 模型设为评估模式
 
-    # 模型预热：刚加载的模型在 GPU 上可能有初始化开销（如显存分配、kernel 编译），预热可以让后续正式生成的速度更稳定；
-    # 预热用第一个问题的前 3 轮对话模拟生成，保证正式推理时无「首次生成卡顿」。
-    if questions: # 这个if又是为什么？？
+    # 模型预热：适配Qwen2.5B的预热逻辑
+    if questions:
         warmup_question = questions[0]
         for _ in range(3):
             torch.manual_seed(0)
             messages = [
-                {"role": "system",
-                "content": SYSTEM_PROMPT},
+                {"role": "system", "content": SYSTEM_PROMPT},
             ]
             for j in range(len(warmup_question["turns"])):
-                messages.append({ # 这是在做什么？
+                messages.append({
                     "role": "user",
                     "content": warmup_question["turns"][j]
                 })
-                # 模拟生成过程（具体逻辑和正式生成一致）
-                output, _, _,_ = generate_single_turn(
+                # 模拟生成过程
+                output, _, _, _ = generate_single_turn(
                     messages, 
                     tokenizer, 
                     model, 
@@ -191,27 +202,24 @@ def get_model_answers(
                 messages.append({"role": "assistant", "content": output})
     print('Warmup done')
 
-    # 正式 批量生成答案
-    # 遍历所有问题，tqdm显示进度
-    # questions=questions[6:]
-    for question in tqdm(questions,desc="Generating answers"):
+    # 正式批量生成答案
+    for question in tqdm(questions, desc="Generating answers"):
         choices = []
-        # 每个问题生成num_choices个答案（默认1）
+        # 每个问题生成num_choices个答案
         for i in range(num_choices):
             torch.manual_seed(i)
             # 系统提示（固定）
             messages = [
-                {"role": "system",
-                 "content": SYSTEM_PROMPT},
+                {"role": "system", "content": SYSTEM_PROMPT},
             ]
             # 存储多轮对话的回复
             turns, idxs, new_tokens, wall_time = [], [], [], []
             
-            # 多轮对话处理（核心逻辑复用）
+            # 多轮对话处理（适配Qwen格式）
             for j in range(len(question["turns"])):
                 # 构造本轮用户问题
                 messages.append({"role": "user", "content": question["turns"][j]})
-                # 直接调用公共生成函数
+                # 调用Qwen适配的生成函数
                 output, new_token, idx, total_time = generate_single_turn(
                     messages, tokenizer, model, temperature
                 )
@@ -221,7 +229,7 @@ def get_model_answers(
                 idxs.append(int(idx))
                 new_tokens.append(int(new_token))
                 wall_time.append(total_time)
-                # 将本轮回复加入对话历史（供下一轮使用）
+                # 将本轮回复加入对话历史
                 messages.append({
                     "role": "assistant",
                     "content": output
@@ -233,13 +241,13 @@ def get_model_answers(
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
         with open(os.path.expanduser(answer_file), "a") as fout:
             ans_json = {
-                "question_id": question["question_id"], # 问题ID
-                "answer_id": shortuuid.uuid(), # 唯一答案ID
-                "model_id": model_id, # 模型ID
-                "choices": choices, # 生成的多个答案
-                "tstamp": time.time(), # 时间戳
+                "question_id": question["question_id"],
+                "answer_id": shortuuid.uuid(),
+                "model_id": model_id,
+                "choices": choices,
+                "tstamp": time.time(),
             }
-            fout.write(json.dumps(ans_json) + "\n") # 按行写入JSONL
+            fout.write(json.dumps(ans_json) + "\n")
 
 
 '''
@@ -253,7 +261,7 @@ def reorg_answer_file(answer_file):
     with open(answer_file, "r") as fin:
         for line in fin:
             data = json.loads(line)
-            answers[data["question_id"]] = line # 去重：按question_id保留最后一个（或第一个）
+            answers[data["question_id"]] = line # 去重：按question_id保留最后一个
 
     # 按question_id排序
     with open(answer_file, "w") as fout:
@@ -263,34 +271,26 @@ def reorg_answer_file(answer_file):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # 模型路径配置
+    # Qwen2.5B模型路径配置（简化为单路径）
     parser.add_argument(
-        "--ea-model-path",
+        "--model-path",
         type=str,
-        default="/workspace/Models/EAGLE3-LLaMA3.1-Instruct-8B/",
-    )
-    parser.add_argument(
-        "--base-model-path", 
-        type=str, 
-        default="/workspace/Models/Llama-3.1-8B-Instruct/",
+        default="/workspace/Models/Qwen-2.5B-Instruct/",
+        help="Path to Qwen2.5B model"
     )
     # 模型基础配置
-    parser.add_argument("--model-id", type=str, default="llama3_8b40")
-    parser.add_argument("--load-in-8bit", action="store_false")
+    parser.add_argument("--model-id", type=str, default="qwen2.5b-instruct")
     # 测试问题配置
-    parser.add_argument("--bench-name",type=str,default="mt_bench")
-    parser.add_argument("--question-begin",type=int)
+    parser.add_argument("--bench-name", type=str, default="mt_bench")
+    parser.add_argument("--question-begin", type=int)
     parser.add_argument("--question-end", type=int)
     parser.add_argument("--answer-file", type=str, help="The output answer file.")
     # 生成参数配置
-    parser.add_argument("--max-new-token",type=int,default=1024)
-    parser.add_argument("--total-token",type=int,default=60)
-    parser.add_argument("--depth",type=int,default=5)
-    parser.add_argument("--top-k",type=int,default=10)
-    parser.add_argument("--num-choices",type=int,default=1)
-    parser.add_argument("--temperature",type=float,default=0.0)
+    parser.add_argument("--max-new-token", type=int, default=1024)
+    parser.add_argument("--num-choices", type=int, default=1)
+    parser.add_argument("--temperature", type=float, default=0.0)
     # 分布式配置
-    parser.add_argument("--num-gpus-per-model",type=int,default=1)
+    parser.add_argument("--num-gpus-per-model", type=int, default=1)
     parser.add_argument("--num-gpus-total", type=int, default=1)
     parser.add_argument("--max-gpu-memory", type=str, default="80GiB")
 
@@ -307,8 +307,7 @@ if __name__ == "__main__":
     print(f"Output to {answer_file}")
 
     run_eval(
-        args.base_model_path,
-        args.ea_model_path,
+        args.model_path,
         args.model_id,
         question_file,
         args.question_begin,
