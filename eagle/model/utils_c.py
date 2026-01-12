@@ -1,179 +1,158 @@
 import torch
 
 # typing
-from typing import List
+from typing import Any, List
 
 TOPK = 10  # topk for sparse tree
 
 
 def pad_path(path: List[int], length: int, pad_value: int = -2) -> List[int]:
-    """
-    Pad the given path list with a specific value up to a specified length.
-
-    Parameters:
-    - path (list): The original list that needs padding.
-    - length (int): The desired length of the padded list.
-    - pad_value (optional, default=-2): The value to use for padding.
-
-    Returns:
-    - list: A new list based on the original path but padded to the desired length.
-
-    Example:
-    >>> pad_path([1,2,3], 5)
-    [1, 2, 3, -2, -2]
-
-    Note:
-    If the given path is already longer than the specified length,
-    then no padding occurs, and the original path is returned.
-    """
-
-    # Calculate the number of padding values needed by subtracting the length
-    # of the path from the desired length.
-    # Append the padding values to the original path and return the new list.
     return path + [pad_value] * (length - len(path))
 
 class node:
-    def __init__(self,parent=None,value=None,dict_key=None):
-        self.parent=parent
-        self.value=value
+    """Eagle3 树节点类（构建树形结构）"""
+    def __init__(self, parent=None, value=None, dict_key=None):
+        self.parent = parent
+        self.value = value
+        self.depth = parent.depth + 1 if parent else 0  # 节点深度（根节点深度0）
+        self.children = []  # 子节点列表
+        self.dict_key = dict_key  # 节点对应的路径元组
+        self.index = -1  # 非叶子节点索引（后续赋值）
         if parent:
-            self.depth=parent.depth+1
             parent.children.append(self)
-        else:
-            self.depth=0
-        self.children=[]
-        self.dict_key=dict_key
-    def is_leaf(self):
-        return len(self.children)==0
 
-    def all_index(self):
+    def is_leaf(self) -> bool:
+        """判断是否为叶子节点"""
+        return len(self.children) == 0
+
+    def all_index(self) -> List[int]:
+        """递归获取当前节点所有祖先节点的索引（含自身）"""
         if not self.parent.parent:
             return [self.index]
-        else:
-            return self.parent.all_index()+[self.index]
-
+        return self.parent.all_index() + [self.index] # 加号代表列表拼接
 
 
 class Tree:
-    def __init__(self,tree_list):
+    """Eagle3 树结构类（基于token路径列表构建树）"""
+    def __init__(self, tree_list: List[List[int]]):
+        # 按路径长度+路径内容排序，确保短路径优先构建
         sorted_tree_list = sorted(tree_list, key=lambda x: (len(x), x))
-        self.root=node()
-        self.node_dic={}
+        self.root = node()  # 根节点
+        self.node_dic = {}  # 路径元组→节点的映射
+
+        # 遍历路径构建树节点
         for tree_node in sorted_tree_list:
-            cur_value=tree_node[-1]
-            if len(tree_node)==1:
-                cur_node=node(parent=self.root,value=cur_value,dict_key=tuple(tree_node))
+            cur_value = tree_node[-1]
+            if len(tree_node) == 1:
+                # 根节点的子节点
+                cur_node = node(parent=self.root, value=cur_value, dict_key=tuple(tree_node))
             else:
-                cur_parent=self.node_dic[tuple(tree_node[:-1])]
-                cur_node = node(parent=cur_parent, value=cur_value,dict_key=tuple(tree_node))
+                # 非根节点，从父节点映射中找父节点
+                cur_parent = self.node_dic[tuple(tree_node[:-1])]
+                cur_node = node(parent=cur_parent, value=cur_value, dict_key=tuple(tree_node))
             self.node_dic[tuple(tree_node)] = cur_node
+
+        # 为非叶子节点分配索引
         self.indexnode()
 
-    def max_depth(self):
+    def max_depth(self) -> int:
+        """获取树的最大深度"""
         return max([item.depth for item in self.node_dic.values()])
 
-    def num_node_wchild(self):
-        num_c=0
-        for item in self.node_dic.values():
-            if not item.is_leaf():
-                num_c+=1
-        return num_c
+    def num_node_wchild(self) -> int:
+        """统计非叶子节点数量"""
+        return sum(1 for item in self.node_dic.values() if not item.is_leaf())
 
-    def get_node_wchild(self):
-        ns=[]
-        for item in self.node_dic.values():
-            if not item.is_leaf():
-                ns.append(item)
-        return ns
+    def get_node_wchild(self) -> List[node]:
+        """获取所有非叶子节点列表"""
+        return [item for item in self.node_dic.values() if not item.is_leaf()]
 
     def indexnode(self):
-        cur_index=0
+        """为非叶子节点分配连续索引"""
+        cur_index = 0
         for key in self.node_dic:
-            cur_node=self.node_dic[key]
+            cur_node = self.node_dic[key]
             if not cur_node.is_leaf():
-                cur_node.index=cur_index
-                cur_index+=1
+                cur_node.index = cur_index
+                cur_index += 1
 
 
+def generate_tree_buffers(tree_choices: List[List[int]], device="cuda") -> dict:
+    """
+    生成Eagle3树推理所需的核心缓冲区（注意力掩码、树索引、位置ID、重复数）
+    Parameters:
+    - tree_choices: token路径列表（如[[1], [1,2], [1,3]]）
+    - device: 张量设备（默认cuda）
+    Returns:
+    - 树缓冲区字典（含attn_mask/tree_indices/position_ids/repeat_nums）
+    """
+    # 构建树结构
+    tree = Tree(tree_choices)
+    nodes_wc = tree.get_node_wchild()  # 非叶子节点列表
+    tree_len = tree.num_node_wchild()  # 非叶子节点数量
+    max_depth = tree.max_depth()  # 树最大深度
 
-
-def generate_tree_buffers(tree_choices, device="cuda"):
-    tree=Tree(tree_choices)
-    sorted_tree_choices = sorted(tree_choices, key=lambda x: (len(x), x))
-    tree_len = tree.num_node_wchild()
-
-
-    max_depth=tree.max_depth()
-    nodes_wc=tree.get_node_wchild()
-
-    depth_counts=[0 for _ in range(max_depth-1)]
+    # 1. 统计各深度的非叶子节点数量
+    depth_counts = [0] * (max_depth - 1)
     for x in nodes_wc:
-        depth_counts[x.depth-1]+=1
-    depth_counts_sum = [sum(depth_counts[:i + 1]) for i in range(len(depth_counts))]
+        depth_counts[x.depth - 1] += 1
+    depth_counts_sum = [sum(depth_counts[:i+1]) for i in range(len(depth_counts))]
 
-
+    # 2. 构建树注意力掩码（自注意力可见性）
     tree_attn_mask = torch.eye(tree_len, tree_len)
+    for id, x in enumerate[node](nodes_wc):
+        tree_attn_mask[id, x.all_index()] = 1  # 祖先节点可见
 
-    for id,x in enumerate(nodes_wc):
-        tree_attn_mask[id,x.all_index()]=1
-
-
-
-
-    tree_attn_mask_list0=[tree_attn_mask[:ml,:ml] for ml in depth_counts_sum]
-    tree_attn_mask_list=[]
-    for id,x in enumerate(tree_attn_mask_list0):
-        x=x[-depth_counts[id]:]
+    # 按深度切分注意力掩码
+    tree_attn_mask_list0 = [tree_attn_mask[:ml, :ml] for ml in depth_counts_sum]
+    tree_attn_mask_list = []
+    for id, x in enumerate[Any](tree_attn_mask_list0):
+        x = x[-depth_counts[id]:]
         tree_attn_mask_list.append(x)
 
-
-
+    # 3. 构建树索引（适配TOPK）
     tree_indices_list = [torch.zeros(ml, dtype=torch.long) for ml in depth_counts]
-    repeat_nums=[[] for _ in depth_counts]
+    repeat_nums = [[] for _ in depth_counts]
     start = 0
-    bias = 0
     for i in range(len(depth_counts)):
         bias = 0
-        repeat_j=0
+        repeat_j = 0
+        parent = None
         for j in range(depth_counts[i]):
             cur_node = nodes_wc[start + j]
             cur_parent = cur_node.parent
 
-            if j != 0:
-                if cur_parent != parent:
-                    bias += 1
-                    parent = cur_parent
-                    repeat_nums[i].append(j-repeat_j)
-                    repeat_j=j
-            else:
+            # 父节点变化时更新偏置
+            if j != 0 and cur_parent != parent:
+                bias += 1
                 parent = cur_parent
-            tree_indices_list[i][j] = cur_node.value + TOPK * (bias)
-        repeat_nums[i].append(j - repeat_j+1)
+                repeat_nums[i].append(j - repeat_j)
+                repeat_j = j
+            else:
+                parent = cur_parent if j == 0 else parent
+
+            # 计算树索引（TOPK * 偏置 + 节点值）
+            tree_indices_list[i][j] = cur_node.value + TOPK * bias
+
+        repeat_nums[i].append(j - repeat_j + 1)
         start += depth_counts[i]
 
+    # 4. 构建位置ID（初始化为0）
     position_ids = [torch.zeros(ml, dtype=torch.long) for ml in depth_counts]
 
-    # start = 0
-    # for i in range(len(depth_counts)):
-    #     position_ids[start: start + depth_counts[i]] = i
-    #     start += depth_counts[i]
-
+    # 整理缓冲区
     tree_buffers = {
         "attn_mask": [i.unsqueeze(0).unsqueeze(0) for i in tree_attn_mask_list],
         "tree_indices": tree_indices_list,
-        "position_ids":position_ids,
-        "repeat_nums":repeat_nums
+        "position_ids": position_ids,
+        "repeat_nums": repeat_nums
     }
 
-    # Move the tensors in the dictionary to the specified device
+    # 张量移到指定设备
     tree_buffers = {
         k: [i.clone().to(device) for i in v]
         if isinstance(v[0], torch.Tensor)
-        else (
-            torch.tensor(v, device=device)
-            if isinstance(v, torch.Tensor)
-            else v
-        )
+        else v
         for k, v in tree_buffers.items()
     }
     return tree_buffers
@@ -181,23 +160,16 @@ def generate_tree_buffers(tree_choices, device="cuda"):
 
 def reset_past_key_values(passed_key_values: List[torch.Tensor]) -> List[torch.Tensor]:
     """
-    Resets the current lengths in the passed key-values to zero.
-
-    This function is designed to be used during the evaluation of a baseline model.
-    It iterates through each layer's key-values and sets their current lengths to zero,
-    effectively resetting their state.
-
-    Args:
-    - passed_key_values (list of torch.Tensor): Contains past hidden states and past attention values for each layer.
-
+    重置Past Key Values的current_length为0（Eagle3推理时重置KV缓存）
+    Parameters:
+    - passed_key_values: 各层的KV缓存列表
     Returns:
-    - passed_key_values (list of torch.Tensor): Updated past hidden states and past attention values with reset lengths.
+    - 重置后的KV缓存列表
     """
     for i in range(len(passed_key_values)):
         for j in range(2):
             passed_key_values[i][j].current_length.fill_(0)
     return passed_key_values
-
 
 
 if __name__=="__main__":
