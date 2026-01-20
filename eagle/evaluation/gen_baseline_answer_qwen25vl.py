@@ -58,14 +58,25 @@ def run_eval(
         with open(question_file, "r") as fin:
             for line in fin:
                 questions.append(json.loads(line))
-        # 应用问题范围筛选
-        if question_begin is not None:
-            questions = questions[question_begin:]
-        if question_end is not None:
-            questions = questions[:question_end - (question_begin or 0)]
+        
+        # 默认只运行20个问题（如果没有指定范围）
+        if question_begin is None and question_end is None:
+            print("注意：没有指定问题范围，默认只运行前20个问题进行测试")
+            questions = questions[:20]
+        else:
+            # 应用问题范围筛选
+            if question_begin is not None:
+                questions = questions[question_begin:]
+            if question_end is not None:
+                questions = questions[:question_end - (question_begin or 0)]
     else:
         # fastchat的标准加载函数
-        questions = load_questions(question_file, question_begin, question_end)
+        if question_begin is None and question_end is None:
+            # 默认只运行20个问题
+            print("注意：没有指定问题范围，默认只运行前20个问题进行测试")
+            questions = load_questions(question_file, 0, 20)
+        else:
+            questions = load_questions(question_file, question_begin, question_end)
 
     # 2. 是否启用Ray分布式：总GPU数 / 单模型GPU数 > 1 → 分布式
     assert num_gpus_total % num_gpus_per_model == 0
@@ -215,15 +226,99 @@ def get_model_answers(
     )
     
     # 使用transformers的标准方式加载模型
-    print("使用AutoModel加载Qwen2.5-VL多模态模型")
-    model = AutoModel.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        device_map="auto",
-        max_memory={i: max_gpu_memory for i in range(torch.cuda.device_count())}
-    )
+    # 尝试多种方式加载模型，优先使用专为条件生成设计的模型类
+    model = None
+    
+    # 1. 首先尝试直接使用Qwen2_5_VLForConditionalGeneration（最适合的类）
+    try:
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        print("尝试使用Qwen2_5_VLForConditionalGeneration加载模型...")
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            device_map="auto",
+            max_memory={i: max_gpu_memory for i in range(torch.cuda.device_count())}
+        )
+        print("✓ 使用Qwen2_5_VLForConditionalGeneration加载成功")
+    except Exception as e:
+        print(f"Qwen2_5_VLForConditionalGeneration加载失败: {e}")
+    
+    # 2. 如果失败，尝试使用AutoModelForCausalLM
+    if model is None:
+        try:
+            from transformers import AutoModelForCausalLM
+            print("尝试使用AutoModelForCausalLM加载模型...")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True,
+                device_map="auto",
+                max_memory={i: max_gpu_memory for i in range(torch.cuda.device_count())}
+            )
+            print("✓ 使用AutoModelForCausalLM加载成功")
+        except Exception as e:
+            print(f"AutoModelForCausalLM加载失败: {e}")
+    
+    # 3. 如果都失败，回退到AutoModel
+    if model is None:
+        try:
+            from transformers import AutoModel
+            print("尝试使用AutoModel加载模型...")
+            model = AutoModel.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True,
+                device_map="auto",
+                max_memory={i: max_gpu_memory for i in range(torch.cuda.device_count())}
+            )
+            print("✓ 使用AutoModel加载成功")
+        except Exception as e:
+            print(f"AutoModel加载失败: {e}")
+            raise RuntimeError(f"无法加载模型: {e}")
+    
+    # 验证模型结构
+    print(f"\n模型类: {type(model).__name__}")
+    print(f"模型是否有generate方法: {hasattr(model, 'generate')}")
+    
+    # 检查权重绑定情况（Qwen2.5-VL的特性）
+    try:
+        # 检查embed_tokens和lm_head是否存在且权重相等
+        if hasattr(model, 'state_dict'):
+            state_dict = model.state_dict()
+            
+            # 检查各种可能的键名
+            embed_keys = ['embed_tokens.weight', 'model.embed_tokens.weight']
+            lm_head_keys = ['lm_head.weight', 'model.lm_head.weight']
+            
+            found_embed = None
+            found_lm_head = None
+            
+            for key in embed_keys:
+                if key in state_dict:
+                    found_embed = key
+                    break
+            
+            for key in lm_head_keys:
+                if key in state_dict:
+                    found_lm_head = key
+                    break
+            
+            if found_embed and found_lm_head:
+                print(f"找到embed_tokens权重: {found_embed}")
+                print(f"找到lm_head权重: {found_lm_head}")
+                
+                # 检查权重是否相等
+                weights_equal = torch.allclose(state_dict[found_embed], state_dict[found_lm_head])
+                print(f"embed_tokens与lm_head权重是否相等: {weights_equal}")
+                
+                if weights_equal:
+                    print("✓ 确认模型使用了权重绑定技术")
+    except Exception as e:
+        print(f"检查权重绑定时出错: {e}")
     
     # 检查并确保模型有生成能力
     if not hasattr(model, 'generate'):
@@ -242,14 +337,33 @@ def get_model_answers(
         # 创建一个简单的生成包装器
         def simple_generate(input_ids, attention_mask=None, max_new_tokens=100, temperature=0.0, **kwargs):
             """简单的生成实现，使用贪婪解码"""
-            generated_ids = input_ids
+            # 获取模型设备
+            model_device = next(base_model.parameters()).device
+            print(f"模型设备: {model_device}")
+            
+            # 确保输入张量在模型设备上
+            generated_ids = input_ids.to(model_device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(model_device)
+            
+            # 检查模型是否有lm_head
+            has_lm_head = hasattr(base_model, 'lm_head')
+            print(f"模型是否有lm_head: {has_lm_head}")
             
             for _ in range(max_new_tokens):
                 # 前向传播
                 outputs = base_model(generated_ids, attention_mask=attention_mask, **kwargs)
                 
-                # 获取最后一个token的logits
-                last_logits = outputs.logits[:, -1, :]
+                # 获取最后一个token的隐藏状态
+                last_hidden_state = outputs.last_hidden_state[:, -1, :]
+                
+                # 如果有lm_head，使用它生成logits
+                if has_lm_head:
+                    last_logits = base_model.lm_head(last_hidden_state)
+                else:
+                    # 如果没有lm_head，直接使用隐藏状态（不推荐，但作为备选）
+                    print("警告：模型没有lm_head，直接使用last_hidden_state作为logits")
+                    last_logits = last_hidden_state
                 
                 # 温度缩放
                 if temperature > 0:
@@ -258,12 +372,15 @@ def get_model_answers(
                 # 贪婪解码
                 next_token = torch.argmax(last_logits, dim=-1, keepdim=True)
                 
+                # 确保next_token在模型设备上
+                next_token = next_token.to(model_device)
+                
                 # 添加到生成的序列中
                 generated_ids = torch.cat([generated_ids, next_token], dim=1)
                 
                 # 更新注意力掩码
                 if attention_mask is not None:
-                    new_mask = torch.ones((attention_mask.shape[0], 1), device=attention_mask.device, dtype=attention_mask.dtype)
+                    new_mask = torch.ones((attention_mask.shape[0], 1), device=model_device, dtype=attention_mask.dtype)
                     attention_mask = torch.cat([attention_mask, new_mask], dim=1)
                 
                 # 检查是否生成了结束标记
@@ -417,11 +534,34 @@ if __name__ == "__main__":
     # 确定问题文件和答案文件路径
     script_dir = os.path.dirname(__file__)
     parent_dir = os.path.dirname(script_dir)
-    # 优先使用--question-file参数，否则自动构建
+    # 优先使用--question-file参数
     if args.question_file:
         question_file = args.question_file
     else:
-        question_file = f"{parent_dir}/data/{args.bench_name}/question.jsonl"
+        # 如果没有提供问题文件参数，尝试常见的默认路径
+        default_paths = [
+            f"{parent_dir}/data/{args.bench_name}/question.jsonl",
+            f"/workspace/datasets/{args.bench_name}/vqa_questions.jsonl",  # 用户的实际数据路径
+            f"/workspace/datasets/{args.bench_name}/{args.bench_name}_questions.jsonl"
+        ]
+        
+        found = False
+        for path in default_paths:
+            if os.path.exists(path):
+                question_file = path
+                found = True
+                print(f"Found question file at: {question_file}")
+                break
+        
+        if not found:
+            print(f"Error: Could not find question file.")
+            print(f"Please provide a valid path using --question-file parameter.")
+            print(f"Tried paths:")
+            for path in default_paths:
+                print(f"  - {path}")
+            sys.exit(1)
+    
+    # 答案文件路径
     answer_file = args.answer_file or f"{args.bench_name}/{args.model_id}.jsonl"
     print(f"Output to {answer_file}")
 
