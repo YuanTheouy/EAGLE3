@@ -1131,11 +1131,11 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
-        all_hidden_states = () if output_hidden_states else None
+        all_hidden_states = () if 1 else None
         all_self_attns = () if output_attentions else None
 
-        for decoder_layer in self.layers:
-            if output_hidden_states:
+        for idx, decoder_layer in enumerate(self.layers):
+            if idx==len(self.layers)-3 or idx==len(self.layers)//2 or idx==2:
                 all_hidden_states += (hidden_states,)
 
             layer_outputs = decoder_layer(
