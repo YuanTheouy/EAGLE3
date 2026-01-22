@@ -3,8 +3,8 @@
 # Stage 1: Text Pre-training
 # Adjust these paths as needed
 BASE_MODEL_PATH="/workspace/Models/Qwen2.5-VL-7B-Instruct"
-TEXT_DATA_PATH="/workspace/prepared_datasets/ultrachat_200k_json/regenerated_complete_train_T00.jsonl"
-SAVE_DIR="./checkpoints/stage1_text"
+TEXT_DATA_PATH="/workspace/datasets/ultra200k/qwen_output/regenerated_gen_test_qwenvl_T00_final.jsonl"
+SAVE_DIR="/workspace/ckpts/stage1_text"
 
 # Create save directory
 mkdir -p $SAVE_DIR

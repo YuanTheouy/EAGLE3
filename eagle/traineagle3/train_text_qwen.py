@@ -8,6 +8,7 @@ parser.add_argument('--trainpath', type=str,
 parser.add_argument('--testpath', type=str,
                     default="/workspace/prepared_datasets/ultrachat_200k_json/regenerated_complete_test_T00.jsonl")
 parser.add_argument('--savedir', type=str, default='/workspace/Models/EAGLE-LLama-3.1-v3')
+parser.add_argument('--num_epochs', type=int, default=40)
 parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
@@ -19,10 +20,10 @@ with open(deepspeed_config) as f:
     ds_config = json.load(f)
 train_config = {
     "bs": ds_config["train_micro_batch_size_per_gpu"],
-    "num_epochs": 40,
+    "num_epochs": args.num_epochs,
     "num_workers": 2,
     "max_len": 2048,
-    "config_path": "/workspace/Models/Qwen2.5-7B-Instruct/config.json",
+    "config_path": "/workspace/Models/Qwen2.5-VL-7B-Instruct/config.json",
     # "gradient_checkpointing": True
     "gradient_checkpointing": False
 }
@@ -62,7 +63,7 @@ def build_dataset_rank(
     ds = ds.shuffle(seed=42)
     ds1 = ds
     original_columns1 = ds1.column_names
-    num_proc = 8
+    num_proc = 4  # [MODIFIED] Reduce num_proc from 8 to 4 to prevent OOM
 
     def preprocess_function(examples):
         new_examples = {
@@ -71,31 +72,36 @@ def build_dataset_rank(
             "loss_mask": []
         }
         for i in range(len(examples['id'])):
-            messages = [
-                {"role": "system",
-                 "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
-            ]
-            convroles = ["user", "assistant"]
-            roles = {"human": "user", "gpt": "assistant", "user": "user", "assistant": "assistant"}
-            source = examples['conversations'][i]
-            if not source:
-                continue
-            if roles[source[0]["from"]] != "user":
-                # Skip the first one if it is not from human
-                source = source[1:]
-            for j, sentence in enumerate(source):
-                role = roles[sentence["from"]]
-                assert role == convroles[j % 2], f"{i}"
-                # if sentence["from"]=="gpt":
-                #     sentence["value"]=" "+sentence["value"]
-                messages.append(
-                    {"role": role, "content": sentence["value"]}
+            try:
+                messages = [
+                    {"role": "system",
+                     "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
+                ]
+                convroles = ["user", "assistant"]
+                roles = {"human": "user", "gpt": "assistant", "user": "user", "assistant": "assistant"}
+                source = examples['conversations'][i]
+                if not source:
+                    continue
+                if roles[source[0]["from"]] != "user":
+                    # Skip the first one if it is not from human
+                    source = source[1:]
+                for j, sentence in enumerate(source):
+                    role = roles[sentence["from"]]
+                    assert role == convroles[j % 2], f"{i}"
+                    # if sentence["from"]=="gpt":
+                    #     sentence["value"]=" "+sentence["value"]
+                    messages.append(
+                        {"role": role, "content": sentence["value"]}
+                    )
+                conversation = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False,
                 )
-            conversation = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
+            except Exception as e:
+                # [ADDED] Skip problematic samples during template application
+                print(f"Skipping sample {i} due to template error: {e}")
+                continue
 
             if not tokenizer.pad_token_id:
                 tokenizer.pad_token_id = tokenizer.unk_token_id
@@ -174,6 +180,8 @@ def build_dataset_rank(
         load_from_cache_file=False
     )
 
+    # [FIXED] Filter out empty samples (where preprocessing failed/skipped)
+    ds1 = ds1.filter(lambda x: len(x["input_ids"]) > 0)
 
     ds1.set_format(type="torch")
     return ds1
@@ -236,7 +244,8 @@ os.makedirs(args.savedir, exist_ok=True)
 if args.local_rank == -1 and "LOCAL_RANK" in os.environ:
     args.local_rank = int(os.environ["LOCAL_RANK"])
 
-config = EConfig.from_pretrained(train_config["config_path"])
+# config = EConfig.from_pretrained(train_config["config_path"])
+config = EConfig.from_pretrained(args.basepath)
 model = Model(config, ds_config, train_config, path=args.basepath, load_emb=True, load_head=True)
 
 # 定义原生 AdamW 优化器
@@ -255,6 +264,12 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 # tokenizer = AutoTokenizer.from_pretrained(args.basepath)
 processor = AutoProcessor.from_pretrained(args.basepath, trust_remote_code=True)
 tokenizer = processor.tokenizer
+
+# [FIXED] Force padding side to left for batched training
+tokenizer.padding_side = 'left' 
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.eos_token_id
 
 traindataset = build_dataset_rank(tokenizer, args.trainpath)
 testdataset = build_dataset_rank(tokenizer, args.testpath)
@@ -296,7 +311,7 @@ if global_rank == 0:
     wandb_dir = os.environ.get("WANDB_DIR", "./wandb")  # 自定义本地目录
     
     wandb.init(
-        project="lamma3-8b-v1",
+        project="lamma-v1",
         entity="1192445377",
         config=ds_config,
         mode=wandb_mode,

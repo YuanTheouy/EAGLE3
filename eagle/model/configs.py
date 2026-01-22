@@ -146,12 +146,16 @@ class EConfig(PretrainedConfig):
             rope_scaling_type = "dynamic"
 
         # ========== 改动3：校验类型（保留linear/dynamic，修复报错逻辑） ==========
-        if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic"]:
+        if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic", "mrope"]:
             raise ValueError(
-                f"`rope_scaling`'s name/type field must be one of ['linear', 'dynamic', 'llama3'], got {rope_scaling_type}"
+                f"`rope_scaling`'s name/type field must be one of ['linear', 'dynamic', 'llama3', 'mrope'], got {rope_scaling_type}"
             )
 
         # ========== 改动4：放宽factor类型（允许int/float，保留>1的限制） ==========
+        # 对于 mrope，允许 factor 不存在或 <= 1.0 (如果需要)
+        if rope_scaling_type == "mrope":
+             return
+
         rope_scaling_factor = self.rope_scaling.get("factor", None)
         # 转换为float（兼容int类型的factor）
         if isinstance(rope_scaling_factor, int):

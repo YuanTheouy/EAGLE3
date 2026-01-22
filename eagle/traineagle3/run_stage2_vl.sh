@@ -4,8 +4,9 @@
 # Adjust these paths as needed
 BASE_MODEL_PATH="/workspace/Models/Qwen2.5-VL-7B-Instruct"
 VQA_DATA_PATH="/workspace/datasets/VQAv2/train.json"
-SAVE_DIR="./checkpoints/stage2_vl"
-STAGE1_CHECKPOINT="./checkpoints/stage1_text/state_0" # Example: load state_0 from stage 1
+SAVE_DIR="/workspace/ckpts/stage2_vl"
+# Path to the checkpoint from Stage 1 (usually inside the save dir, e.g., state_X)
+STAGE1_CHECKPOINT="/workspace/ckpts/stage1_text/state_0" 
 
 # Create save directory
 mkdir -p $SAVE_DIR

@@ -93,7 +93,18 @@ def initialize_past_key_values(model,max_length=2200):
         try:
             device = model.model.layers[i].self_attn.q_proj.weight.device
         except:
-            device=model.layers[i].self_attn.q_proj.weight.device
+            try:
+                device=model.layers[i].self_attn.q_proj.weight.device
+            except:
+                # For Qwen2.5-VL and similar models where layers might be nested or named differently
+                # Qwen2.5-VL usually has model.layers if it's the base model, 
+                # but if 'model' is Qwen2_5_VLForConditionalGeneration, the structure is model.model.layers
+                # If both failed, we try to inspect the model structure more robustly or default to model.device
+                if hasattr(model, "device"):
+                    device = model.device
+                else:
+                    # Fallback to the first parameter's device
+                    device = next(model.parameters()).device
         devices.append(device)
     past_key_values_data_list=[]
     startnum=0

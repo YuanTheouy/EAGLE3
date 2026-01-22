@@ -8,6 +8,8 @@ parser.add_argument('--trainpath', type=str,
 parser.add_argument('--testpath', type=str,
                     default="/workspace/prepared_datasets/ultrachat_200k_json/regenerated_complete_test_T00.jsonl")
 parser.add_argument('--savedir', type=str, default='/workspace/Models/EAGLE-LLama-3.1-v3')
+parser.add_argument('--text_model_path', type=str, default=None, help="Path to pre-trained text model checkpoint (Stage 1)")
+parser.add_argument('--num_epochs', type=int, default=40)
 parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
@@ -19,10 +21,10 @@ with open(deepspeed_config) as f:
     ds_config = json.load(f)
 train_config = {
     "bs": ds_config["train_micro_batch_size_per_gpu"],
-    "num_epochs": 40,
+    "num_epochs": args.num_epochs,
     "num_workers": 2,
     "max_len": 2048,
-    "config_path": "/workspace/Models/Qwen2.5-7B-Instruct/config.json",
+    "config_path": "/workspace/Models/Qwen2.5-VL-7B-Instruct/config.json",
     # "gradient_checkpointing": True
     "gradient_checkpointing": False
 }
@@ -300,7 +302,10 @@ os.makedirs(args.savedir, exist_ok=True)
 if args.local_rank == -1 and "LOCAL_RANK" in os.environ:
     args.local_rank = int(os.environ["LOCAL_RANK"])
 
-config = EConfig.from_pretrained(train_config["config_path"])
+deepspeed.init_distributed(dist_backend="nccl")
+
+# config = EConfig.from_pretrained(train_config["config_path"])
+config = EConfig.from_pretrained(args.basepath)
 model = Model(config, ds_config, train_config, path=args.basepath, load_emb=True, load_head=True)
 
 # 定义原生 AdamW 优化器
@@ -325,9 +330,6 @@ testdataset = build_dataset_rank(tokenizer, args.testpath)
 
 
 
-model.scandata(args.trainpath, args.basepath)
-
-
 criterion = nn.SmoothL1Loss(reduction="none")
 
 num_epochs = train_config["num_epochs"]
@@ -338,6 +340,12 @@ model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
                                                      optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5),
                                                      model_parameters=model.parameters(),
                                                      )
+
+# Ensure scandata runs on all ranks for ZeRO-3 gathering, but file write is guarded in scandata
+if hasattr(model_engine, "module"):
+    model_engine.module.scandata(args.trainpath, args.basepath)
+else:
+    model_engine.scandata(args.trainpath, args.basepath)
 
 deepspeed.comm.barrier()
 

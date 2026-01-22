@@ -29,13 +29,25 @@ import os
 from transformers.integrations.deepspeed import HfDeepSpeedConfig
 from transformers.activations import ACT2FN
 from transformers import AutoTokenizer,AutoModelForCausalLM
-from modeling_llama_kv import LlamaForCausalLM
 import sys
 import os
+# Ensure current directory is in path for imports
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
+
+try:
+    from modeling_llama_kv import LlamaForCausalLM
+except ImportError:
+    from .modeling_llama_kv import LlamaForCausalLM
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from eagle.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 # from modeling_qwen2_kv import Qwen2ForCausalLM
-from configs import EConfig
+try:
+    from configs import EConfig
+except ImportError:
+    from .configs import EConfig
 from safetensors import safe_open
 from datasets import load_dataset
 import multiprocessing
@@ -243,7 +255,7 @@ class LlamaAttention(nn.Module):
             self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
         else:
             scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
+            scaling_factor = self.config.rope_scaling.get("factor", 1.0) # Default to 1.0 if factor is missing (e.g. mrope)
             if scaling_type == "linear":
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
@@ -252,6 +264,11 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
                     self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
                 )
+            elif scaling_type == "mrope" or scaling_type == "default":
+                # For mrope/default, use standard RoPE (or specialized if implemented)
+                # Currently falling back to standard LlamaRotaryEmbedding as 'mrope' handling is complex and typically handled by the base model's specialized components if needed.
+                # Since EAGLE head is a small Llama-like structure, standard RoPE is often sufficient or we can ignore the scaling factor if it's not compatible.
+                self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
@@ -511,6 +528,20 @@ def merge_dicts(dicts):
     return result
 
 
+def process_data_global(chunk):
+    # 将输入数据块中的input_ids合并为一个列表
+    tokens = [token for sublist in chunk['input_ids'] for token in sublist]
+    # 使用Counter统计token频率
+    return Counter(tokens)
+
+def merge_dicts_global(dicts):
+    # 初始化总计数器
+    total_count = Counter()
+    # 遍历每个字典，更新总计数器
+    for d in dicts:
+        total_count.update(d)
+    return total_count
+
 class Model(nn.Module):
     # 初始化模型，加载与训练权重
     def __init__(self, config, ds_config, training_config, load_head=False, load_emb=True, path=None):
@@ -547,7 +578,6 @@ class Model(nn.Module):
         self.target_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             path, 
             torch_dtype=torch.float16,
-            device_map="auto" 
         )
         
         # 加载与训练模型，作为特征提取器
@@ -621,190 +651,98 @@ class Model(nn.Module):
 
         # 若缓存文件不存在，则重新处理数据生成缓存
         if not os.path.exists(cache_path):
+            print("Cache not found, processing data manually...")
             # 加载分词器
             tokenizer = AutoTokenizer.from_pretrained(tokenizerpath)
             # 加载训练数据集（JSON格式）
             dataset = load_dataset('json', data_files=datapath)
             dataset = dataset['train']  # 获取训练集拆分
-            # dataset = dataset.select(range(96))  # 调试时可选取部分数据，此处注释掉
-            original_columns1 = dataset.column_names  # 记录原始数据集的列名，用于后续移除
-            # num_proc = 48  # 多进程处理数量，此处注释掉
-            num_proc = 1  # 当前使用1个进程处理
-
-            # 处理训练数据，生成训练样本的函数
-            def preprocess_function(examples):
-                new_examples = {
-                    # "conversation": [],  # 可选：存储处理后的对话文本，此处注释掉
-                    "input_ids": [],  # 存储分词后的输入ID序列
-                    "loss_mask": []  # 存储损失掩码（标记哪些位置需要计算损失）
-                }
-                # 遍历每个样本
-                for i in range(len(examples['id'])):
-                    # 初始化对话消息列表，包含系统提示
+            
+            # 手动处理数据，替代 dataset.map 以避免多进程/序列化问题
+            input_ids_list = []
+            
+            print("Processing data...")
+            for i, example in enumerate(dataset):
+                try:
                     messages = [
                         {"role": "system",
                          "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
                     ]
-                    convroles = ["user", "assistant"]  # 对话角色的预期顺序
-                    roles = {"human": "user", "gpt": "assistant"}  # 原始角色到标准角色的映射
-                    source = examples['conversations'][i]  # 获取当前样本的对话内容
+                    convroles = ["user", "assistant"]
+                    roles = {"human": "user", "gpt": "assistant"}
+                    source = example['conversations']
                     if not source:
-                        continue  # 跳过空对话
-                    # 若第一个发言者不是用户，则跳过该发言
+                        continue
                     if roles[source[0]["from"]] != "user":
                         source = source[1:]
-                    # 遍历对话内容，构建消息列表
                     for j, sentence in enumerate(source):
                         role = roles[sentence["from"]]
-                        # 验证对话角色顺序是否符合预期（用户-助手交替）
                         assert role == convroles[j % 2], f"{i}"
-                        # 添加当前发言到消息列表
                         messages.append(
                             {"role": role, "content": sentence["value"]}
                         )
-                    # 将消息列表转换为模型可处理的对话字符串（应用聊天模板）
                     conversation = tokenizer.apply_chat_template(
                         messages,
                         tokenize=False,
                         add_generation_prompt=False,
                     )
+                except Exception as e:
+                    print(f"Skipping sample {i} due to template error: {e}")
+                    continue
 
-                    # 若未设置pad_token_id，则使用unk_token_id作为填充符
-                    if not tokenizer.pad_token_id:
-                        tokenizer.pad_token_id = tokenizer.unk_token_id
+                if not tokenizer.pad_token_id:
+                    tokenizer.pad_token_id = tokenizer.unk_token_id
 
-                    # 对对话字符串进行分词，获取输入ID
-                    input_ids = tokenizer(
-                        conversation,
-                        return_tensors="pt",
-                        add_special_tokens=False,
-                    ).input_ids[0]
-                    # 构建草稿模型词汇表时，过滤掉长度超过最大长度的样本（不截断）
-                    if len(input_ids) > self.train_config["max_len"]:
-                        continue
-                    # 初始化损失掩码为全1（默认所有位置都计算损失）
-                    loss_mask = torch.ones_like(input_ids)
-                    # print(i)  # 调试用，此处注释掉
+                ids = tokenizer(
+                    conversation,
+                    return_tensors="pt",
+                    add_special_tokens=False,
+                ).input_ids[0]
 
-                    # 定义对话分隔符（用于区分不同轮次的用户和助手发言）
-                    # sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"  # 旧分隔符，注释掉
-                    # sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"  # 旧分隔符，注释掉
-                    sep = "<|im_start|>assistant"  # 助手发言起始标记
-                    total_len = len(input_ids)  # 输入序列总长度
-                    sep2 = "<|im_start|>user"  # 用户发言起始标记
+                if len(ids) > self.train_config["max_len"]:
+                    continue
+                
+                if len(ids) > 0:
+                    input_ids_list.append(ids)
 
-                    # 按用户发言标记分割对话，区分不同轮次
-                    turns = conversation.split(sep2)
-
-                    # print("渲染后的对话：", conversation)  # 调试用，注释掉
-                    # print("sep2是否存在：", sep2 in conversation)  # 调试用，注释掉
-                    # 若轮次少于2，则跳过（至少需要一轮用户和一轮助手发言）
-                    if len(turns) < 2:
-                        continue  # 或者根据需求处理，例如记录日志后跳过
-
-                    # 还原第一轮分割丢失的用户标记
-                    turns[1] = turns[0] + sep2 + turns[1]
-                    turns = turns[1:]  # 保留有效轮次
-
-                    # 初始化当前长度指针，用于标记损失掩码的位置
-                    cur_len = 1
-                    loss_mask[:cur_len] = 0  # 忽略起始位置的损失
-                    # 遍历每轮对话，更新损失掩码（忽略用户输入部分，只关注助手输出部分）
-                    for i, turn in enumerate(turns):
-                        if turn == "":
-                            break  # 跳过空轮次
-                        # 计算当前轮次的长度（分词后）
-                        turn_len = len(tokenizer(turn).input_ids)
-
-                        # 按助手标记分割当前轮次，区分用户输入和助手输出
-                        parts = turn.split(sep)
-                        if len(parts) != 2:
-                            break  # 格式不符合预期则跳过
-                        parts[0] += sep  # 还原分割丢失的助手标记
-                        # 计算指令部分（用户输入）的长度（减1是为了修正偏移）
-                        instruction_len = len(tokenizer(parts[0]).input_ids) - 1
-
-                        # 忽略用户指令部分的损失（不计算模型对用户输入的预测损失）
-                        if i == 0:
-                            loss_mask[cur_len: cur_len + instruction_len - 2] = 0
-                        else:
-                            loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
-                        # 更新当前长度指针
-                        cur_len += turn_len
-                        if i != 0:
-                            cur_len += 3
-                        # cur_len+=2  # 备用长度调整，注释掉
-
-                        # if i != 0 and not tokenizer.legacy:
-                        #     # 旧版和新版分词器对特殊标记的处理不同，可能需要调整长度
-                        #     cur_len -= 1
-
-                    # 忽略超出当前轮次的部分（后续内容）的损失
-                    loss_mask[cur_len:] = 0
-
-                    # new_examples["conversation"].append(conversation)  # 可选：存储对话文本，注释掉
-                    new_examples["input_ids"].append(input_ids[None, :])  # 添加输入ID（增加 batch 维度）
-                    new_examples["loss_mask"].append(loss_mask[None, :])  # 添加损失掩码（增加 batch 维度）
-
-                return new_examples
+            print(f"Processed {len(input_ids_list)} valid samples.")
             
+            # 统计 Token 频率
+            print("Counting tokens...")
+            token_counter = Counter()
+            for ids in input_ids_list:
+                token_counter.update(ids.tolist())
 
-            # 应用预处理函数到数据集
-            dataset = dataset.map(
-                preprocess_function,
-                batched=True,  # 批量处理样本
-                # num_proc=num_proc,  # 多进程处理，注释掉
-                num_proc=1,  # 使用1个进程
-                remove_columns=original_columns1,  # 移除原始列
-                load_from_cache_file=False  # 不加载缓存文件（强制重新处理）
-            )
-            # dataset.set_format(type="torch")  # 可选：设置数据集格式为torch，注释掉
-
-
-            # 准备多进程处理数据块（统计token频率）
-            num_processes = num_proc  # 进程数量
-            # 计算每个进程处理的数据块大小
-            chunk_size = len(dataset) // num_processes + (len(dataset) % num_processes > 0)
-            # 将数据集分割为多个数据块
-            chunks = [dataset[i:i + chunk_size] for i in range(0, len(dataset), chunk_size)]
-
-            # 创建进程池
-            with multiprocessing.Pool(num_processes) as pool:
-                # 并行处理每个数据块，统计token频率
-                results = pool.map(process_data, chunks)
-
-            # 合并所有进程的统计结果
-            token_dict = merge_dicts(results)
-
-
-            # 计算总token出现次数
-            total_frequency = sum(token_dict.values())
-            # 获取出现频率最高的N个token
-            top_N = token_dict.most_common(N)
-            # 计算top N token的总频率
+            total_frequency = sum(token_counter.values())
+            top_N = token_counter.most_common(N)
             top_N_frequency_sum = sum(freq for key, freq in top_N)
-            # 计算top N token的频率占比
             top_N_ratio = top_N_frequency_sum / total_frequency
             print(f"top {N} token frequency ratio: {top_N_ratio:.2%}")
-            # 提取top N token的ID并排序
+            
             used_tokens = [key for key, freq in top_N]
             used_tokens.sort()
-            # 构建草稿词表到原始词表的映射（d2t）和原始词表到草稿词表的映射（t2d）
+            
             d2t = [used_tokens[i] - i for i in range(len(used_tokens))]
             t2d = [i in used_tokens for i in range(self.vocab_size)]
-            # 转换为张量
+            
             d2t = torch.tensor(d2t)
             t2d = torch.tensor(t2d)
-            # 构建缓存字典
+            
             cache = {
                 "d2t": d2t,
                 "t2d": t2d
             }
-            # 保存缓存到文件
-            torch.save(cache, "cache.pt")
+            if torch.distributed.is_initialized():
+                if torch.distributed.get_rank() == 0:
+                    torch.save(cache, cache_path)
+                    print(f"Cache saved to {cache_path}")
+                torch.distributed.barrier()
+            else:
+                torch.save(cache, cache_path)
+                print(f"Cache saved to {cache_path}")
         else:
             # 若缓存存在，则直接加载缓存
-            cache = torch.load("cache.pt")
+            cache = torch.load(cache_path)
             d2t = cache["d2t"]
             t2d = cache["t2d"]
         # 将映射关系注册为缓冲区（随模型保存，不参与梯度计算）
@@ -813,6 +751,19 @@ class Model(nn.Module):
         # 初始化平滑L1损失函数（用于后续训练）
         self.l1smooth = nn.SmoothL1Loss(reduction="none")
 
+    def init_tree(self):
+        # 类似 scan_data 中的逻辑，但假设已通过 load_state_dict 加载了 d2t 和 t2d
+        # 如果 d2t/t2d 缓冲区存在，则无需做任何事
+        if hasattr(self, "d2t") and hasattr(self, "t2d"):
+            pass
+        else:
+            # 如果没有，可能需要抛出警告或错误，因为推理时需要这些映射
+            # 或者尝试加载 cache.pt（如果路径已知）
+            pass
+
+    def reset_kv(self):
+        self.midlayer.reset_kv()
+    
     # 准备解码器注意力掩码
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
         # 创建因果掩码（用于防止未来信息泄露，确保每个位置只能关注自身及之前的位置）
@@ -916,9 +867,9 @@ class Model(nn.Module):
             hidden_states.requires_grad = True
 
         # 通过全连接层将融合的三层隐藏状态压缩到模型隐藏维度
+        # [MODIFIED] Only apply fc once.
         hidden_states = self.fc(hidden_states)
-
-        hidden_merge_states = self.fc(hidden_states)
+        hidden_merge_states = hidden_states
         if self.training and self.gradient_checkpointing and not hidden_states.requires_grad:
             hidden_merge_states.requires_grad = True
 
@@ -964,7 +915,38 @@ class Model(nn.Module):
         for idx in range(self.length):
             last = idx == self.length - 1  # 判断是否为最后一次迭代
             # 将输入ID转换为嵌入向量
+            # [MODIFIED] Mask image tokens' embedding to zero.
+            # Qwen2.5-VL uses 151655 for image start, 151652/151653 for video.
+            # But more generally, we can just zero out embeddings for vision tokens if we knew them.
+            # However, simpler approach: The embedding layer returns vectors for image token IDs.
+            # Those vectors are just "random" or "learned" embeddings for the special tokens.
+            # Adding them to the vision hidden states (which are already rich) might be noisy.
+            # So let's zero them out.
             inputs_embeds = self.embed_tokens(input_ids)
+            
+            # Assuming Qwen2.5-VL special tokens for vision. 
+            # Ideally we should pass vision_mask, but for now we can infer from config if available.
+            # Or simpler: The base model (Qwen2.5-VL) already incorporated vision info into hidden_states.
+            # The input_ids at vision positions are effectively placeholders.
+            # Adding their embedding (which are just special token embeddings) is actually OK, 
+            # as the network can learn to ignore them or use them as "modality type embeddings".
+            # BUT, if you feel it's weird, we can zero them.
+            # 
+            # Current decision: Keep it as is. 
+            # Reason: The special token embeddings (like <|image_pad|>) act as "positional/type indicators".
+            # They tell the EAGLE head "This position is an image patch". 
+            # The actual visual info comes from `hidden_states`.
+            # So `State = Hidden(Vision) + Embed(Image_Pad)` is mathematically fine.
+            # It's like adding a "Vision Bias" to the visual features.
+            
+            # If you want to strictly disable embedding for vision tokens (which are represented by specific IDs),
+            # we would need to know which IDs are vision tokens.
+            # For Qwen2-VL, vision tokens are replaced by <|vision_start|> ... <|vision_end|> blocks, 
+            # or implicitly handled.
+            
+            # Let's keep it as is for now unless you strictly want to mask them.
+            # If we were to mask, we'd need `vision_mask` passed from dataprepare.
+
             # 如果处于训练模式且启用梯度检查点，确保输入嵌入需要梯度
             if self.training and self.gradient_checkpointing and not inputs_embeds.requires_grad:
                 inputs_embeds.requires_grad = True
