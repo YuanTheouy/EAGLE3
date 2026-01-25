@@ -699,25 +699,34 @@ class Model(nn.Module):
         # Align hidden_states length to input_ids_step length
         # This handles cases where base model outputs extra tokens (e.g. BOS) or expands tokens
         if hidden_states.shape[1] != input_ids_step.shape[1]:
-            # print(f"DEBUG: Shape mismatch! hidden_states: {hidden_states.shape}, input_ids_step: {input_ids_step.shape}")
-            if hidden_states.shape[1] > input_ids_step.shape[1]:
-                hidden_states = hidden_states[:, -input_ids_step.shape[1]:]
+            n = min(hidden_states.shape[1], input_ids_step.shape[1])
+            if n > 0:
+                hidden_states = hidden_states[:, -n:]
+                input_ids_step = input_ids_step[:, -n:]
             else:
-                input_ids_step = input_ids_step[:, -hidden_states.shape[1]:]
+                # If no overlap, keep the last hidden state for fallback
+                if hidden_states.shape[1] > 0:
+                    hidden_states = hidden_states[:, -1:]
+                input_ids_step = input_ids_step[:, :0]
 
         # with Timer("draft many"):
-        if hasattr(self, "stable_kv") and self.stable_kv is not None:
-            # [MODIFIED] Exclude the last token (sample_token) from catch-up phase
-            # because we don't have base model hidden state for it.
-            # We will process it separately using the output of catch-up.
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids_step,
-                                               past_key_values=self.stable_kv, use_cache=True)
-        else:
-            # If stable_kv is None (prefill)
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids_step, use_cache=True)
+        if input_ids_step.shape[1] > 0 and hidden_states.shape[1] > 0:
+            if hasattr(self, "stable_kv") and self.stable_kv is not None:
+                # [MODIFIED] Exclude the last token (sample_token) from catch-up phase
+                # because we don't have base model hidden state for it.
+                # We will process it separately using the output of catch-up.
+                out_hidden, past_key_values = self(hidden_states, input_ids=input_ids_step,
+                                                   past_key_values=self.stable_kv, use_cache=True)
+            else:
+                # If stable_kv is None (prefill)
+                out_hidden, past_key_values = self(hidden_states, input_ids=input_ids_step, use_cache=True)
             
-        self.stable_kv = past_key_values
-        last_hidden = out_hidden[:, -1]
+            self.stable_kv = past_key_values
+            last_hidden = out_hidden[:, -1]
+        else:
+            # Fallback: use the last available hidden state
+            last_hidden = hidden_states[:, -1]
+            past_key_values = self.stable_kv
 
         # [MODIFIED] Process sample_token (x_{last+1}) using last_hidden (feature(x_{last}))
         # This computes feature(x_{last+1})

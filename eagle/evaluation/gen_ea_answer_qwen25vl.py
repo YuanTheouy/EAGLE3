@@ -4,6 +4,7 @@ import os
 import time
 import torch
 import shortuuid
+import random
 from tqdm import tqdm
 from accelerate.utils import set_seed
 from transformers import AutoProcessor, AutoConfig
@@ -22,6 +23,21 @@ from eagle.model.cnets_vl import Model as EaLayerVL
 from eagle.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from eagle.model.configs import EConfig
 
+SYSTEM_PROMPT = (
+    "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."
+)
+
+def reorg_answer_file(answer_file):
+    """Sort by question id and de-duplication"""
+    answers = {}
+    with open(answer_file, "r") as fin:
+        for line in fin:
+            data = json.loads(line)
+            answers[data["question_id"]] = line
+    with open(answer_file, "w") as fout:
+        for qid in sorted(list(answers.keys())):
+            fout.write(answers[qid])
+
 # Monkey patch LlamaAttention._init_rope to support mrope
 original_init_rope = cnets.LlamaAttention._init_rope
 
@@ -39,8 +55,149 @@ from eagle.model.utils import (
     generate_candidates,
     tree_decoding,
     evaluate_posterior,
-    update_inference_inputs
+    update_inference_inputs,
+    LogitsProcessorList
 )
+from typing import List, Tuple
+
+def tree_decoding_vl(
+    model,
+    tree_candidates: torch.Tensor,
+    past_key_values,
+    tree_position_ids: torch.Tensor,
+    input_ids: torch.Tensor,
+    retrieve_indices: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+    """
+    VL-adapted tree decoding: correctly handles position_ids offset using actual KV cache length
+    instead of input_ids length (which misses vision tokens).
+    """
+    # [FIX] Get actual KV cache length from the first layer's key cache
+    # past_key_values is a list of [key_cache, value_cache] per layer
+    # key_cache is a KVCache object with .current_length attribute
+    if isinstance(past_key_values, list) and len(past_key_values) > 0:
+        current_kv_len = past_key_values[0][0].current_length.item()
+    else:
+        # Fallback for standard cache (unlikely in Eagle)
+        current_kv_len = input_ids.shape[1]
+        
+    # Calculate position IDs based on actual context length (Vision + Text)
+    position_ids = tree_position_ids + current_kv_len
+    
+    if position_ids.dim() == 1:
+        position_ids = position_ids.unsqueeze(0)
+
+    # Tree decoding forward pass
+    outputs, tree_logits, hidden_state = model(
+        tree_candidates,
+        output_orig=True,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+    )
+
+    # Eagle3 logic: concatenate last 3 hidden states
+    # [FIX] Use first 3 layers [0, 1, 2] to match training if confirmed, 
+    # or [-3:] if that was the intent. Keeping [-3:] as per original script for now,
+    # but user should verify training config.
+    ea_device = model.ea_layer.lm_head.weight.device
+    hidden_states = [x.to(ea_device) for x in outputs["hidden_states"]]
+    # Note: Training code uses [0, 1, 2]. If this script used [-3:], it might be wrong.
+    # We will stick to the local implementation logic but ensure it's consistent.
+    # The user previously flagged this. Let's use the same logic as in eagenerate.
+    # In eagenerate we changed it to [0, 1, 2]. Let's align here.
+    hidden_state = torch.cat([hidden_states[0], hidden_states[1], hidden_states[2]], dim=-1)
+
+    # Filter logits by retrieve indices
+    logits = tree_logits[0, retrieve_indices]
+
+    return logits, hidden_state, outputs
+
+def update_inference_inputs_vl(
+    input_ids: torch.Tensor,
+    candidates: torch.Tensor,
+    best_candidate: torch.Tensor,
+    accept_length: int,
+    retrieve_indices: torch.Tensor,
+    logits_processor: LogitsProcessorList,
+    new_token: int,
+    past_key_values_data_list: List[torch.Tensor],
+    current_length_data: torch.Tensor,
+    model,
+    hidden_state_new: torch.Tensor,
+    sample_p: torch.Tensor
+    ) -> Tuple[torch.Tensor, List[List[int]], torch.Tensor, torch.Tensor, torch.Tensor, int, None, torch.Tensor]:
+    """
+    VL-adapted update: updates KV cache at the correct index (end of Vision+Text) 
+    instead of overwriting Vision tokens at input_ids length.
+    """
+    # [FIX] Use current_length_data to determine where to write new KV
+    # current_length_data tracks the valid length of the cache (Vision + Text)
+    prev_input_len = current_length_data[0].item()
+
+    # Select best candidate indices
+    # Note: retrieve_indices are relative to the tree start.
+    # We need to map them to the cache indices.
+    # The tree candidates were generated *after* prev_input_len.
+    select_indices = retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
+    select_indices = select_indices.to(input_ids.device)
+
+    # Update input_ids (Text only)
+    best_candidate_tokens = candidates[best_candidate, : accept_length + 1].unsqueeze(0).to(input_ids.device)
+    input_ids = torch.cat([input_ids, best_candidate_tokens], dim=-1)
+
+    # Update Past Key Values
+    for past_kv_data in past_key_values_data_list:
+        # Source: KV for the candidates (computed during tree decoding)
+        # Tree decoding used position_ids starting at prev_input_len.
+        # So the KV cache for these candidates is already at the correct positions in the temp cache?
+        # Wait, Eagle's tree decoding writes to the *same* cache but at temporary positions?
+        # No, Eagle usually assumes we copy from the 'tree' positions to the 'main' positions.
+        
+        # In standard Eagle, `past_kv_data` holds everything.
+        # The tree decoding step wrote KV to `select_indices`.
+        # We now need to "finalize" the accepted path by moving it to be contiguous?
+        # Actually, Eagle's KV cache is managed such that we copy the accepted tokens 
+        # to the position immediately following the previous valid length.
+        
+        # Source indices are where the tree nodes were placed.
+        tgt = past_kv_data[..., select_indices, :]
+        
+        # Destination indices are contiguous after the previous length
+        dst = past_kv_data[..., prev_input_len: prev_input_len + tgt.shape[-2], :]
+        dst.copy_(tgt, non_blocking=True)
+
+    # Update current_length
+    current_length_data.fill_(prev_input_len + tgt.shape[-2])
+
+    # Update hidden state for next tree generation
+    retrieve_hidden_state = hidden_state_new[:, retrieve_indices]
+    accept_hidden_state = retrieve_hidden_state[:, best_candidate, : accept_length + 1]
+
+    # Sample new token
+    if logits_processor is not None:
+        new_sample_token = torch.multinomial(sample_p, 1).unsqueeze(0)
+    else:
+        new_sample_token = torch.argmax(sample_p).unsqueeze(0).unsqueeze(0)
+
+    # Generate new tree
+    new_input_ids = torch.cat([input_ids, new_sample_token.to(input_ids.device)], dim=1)
+    
+    # [FIX] Hidden states concat logic in topK_genrate is inside EaLayer, which we can't easily change here.
+    # But we passed `accept_hidden_state` which is derived from `hidden_state_new`.
+    # `hidden_state_new` came from `tree_decoding_vl` where we already fixed the concat logic.
+    
+    draft_tokens, new_retrieve_indices, new_tree_mask, new_tree_position_ids = model.ea_layer.topK_genrate(
+        accept_hidden_state, new_input_ids, model.base_model.lm_head, logits_processor
+    )
+
+    # Update token count
+    new_token += accept_length + 1
+
+    return (
+        input_ids, draft_tokens, new_retrieve_indices, new_tree_mask,
+        new_tree_position_ids, new_token, None, new_sample_token
+    )
+
 
 def load_image(image_path_or_url):
     if image_path_or_url.startswith('http://') or image_path_or_url.startswith('https://'):
@@ -120,30 +277,9 @@ class EaModelVL(torch.nn.Module):
         print("Loading Eagle Layer weights...")
         self.ea_layer.load_state_dict(ea_layer_state_dict, strict=False)
         self.ea_layer.to(self.base_model.dtype).to(device)
-        # init_tree 是在 Eagle 训练代码中的方法，但在 cnets_vl.py 中似乎没有定义。
-        # 检查 cnets.py 或相关逻辑，init_tree 通常用于初始化树结构。
-        # 如果 cnets_vl.py 没有 init_tree，我们需要手动添加或移除调用。
-        # 观察 cnets_vl.py，似乎没有 init_tree 方法。
-        # 但是 EAGLE 的推理需要树结构。
-        # 让我们检查一下是否需要从 cnets.py 中借用 init_tree 或者自己实现。
-        # 在 gen_ea_answer_llama3chat.py 中调用了 init_tree。
-        # 假设 cnets_vl.py 的 Model 类应该有 init_tree，但可能漏掉了。
-        # 或者我们可以直接在这里实现 init_tree 的逻辑。
         
-        # 尝试调用 init_tree，如果不存在则调用我们刚才添加的 init_tree (在 cnets_vl.py 中)
-        # 注意：我们已经在 cnets_vl.py 中添加了 init_tree 方法。
-        # 但是 Python 的导入机制可能没有重新加载修改后的 cnets_vl.py，或者修改没有生效（如果是热重载环境）。
-        # 但在这个环境中，每次运行都是新的进程，所以应该生效。
-        # 报错 'Model' object has no attribute 'init_tree' 说明 Model 类（即 EaLayerVL）确实没有这个方法。
-        # 可能是之前的 SearchReplace 没有成功添加 init_tree 到 Model 类中？
-        # 让我们再次检查 cnets_vl.py 的 Model 类。
-        
-        if hasattr(self.ea_layer, "init_tree"):
-            self.ea_layer.init_tree()
-        else:
-            # 如果真的没有，手动执行逻辑
-            if hasattr(self.ea_layer, "d2t") and hasattr(self.ea_layer, "t2d"):
-                 pass
+        # 初始化树结构
+        self.ea_layer.init_tree()
 
     @classmethod
     def from_pretrained(
@@ -313,12 +449,16 @@ class EaModelVL(torch.nn.Module):
 
         # === 2. Decoding Loop ===
         for idx in range(max_gen_length):
-            self.base_model.model.tree_mask = tree_mask
+            if hasattr(self.base_model.model, "language_model"):
+                self.base_model.model.language_model.tree_mask = tree_mask
+            else:
+                self.base_model.model.tree_mask = tree_mask
+            
             draft_tokens = draft_tokens.to(input_ids.device)
 
             # Tree Decoding (Base Model Verification)
-            # 注意：后续步骤不需要 pixel_values，因为 KV Cache 已经包含了视觉信息
-            logits, hidden_state_new, outputs = tree_decoding(
+            # [MODIFIED] Use VL-adapted tree decoding
+            logits, hidden_state_new, outputs = tree_decoding_vl(
                 self,
                 draft_tokens,
                 past_key_values,
@@ -333,9 +473,13 @@ class EaModelVL(torch.nn.Module):
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
+            
+            # [DEBUG] Print accept length to monitor performance
+            # print(f"DEBUG: accept_length={accept_length}")
 
             # Update Inference Inputs
-            input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
+            # [MODIFIED] Use VL-adapted update function
+            input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs_vl(
                 input_ids,
                 candidates,
                 best_candidate,
@@ -366,17 +510,47 @@ class EaModelVL(torch.nn.Module):
 
 # ===================== 主逻辑 =====================
 
-def run_eval(
+def generate_single_turn(messages, processor, model, temperature, max_new_tokens):
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt"
+    )
+    inputs = inputs.to(model.base_model.device)
+    
+    torch.cuda.synchronize()
+    start_time = time.time()
+    output_ids, new_token, idx = model.eagenerate(
+        input_ids=inputs.input_ids,
+        pixel_values=inputs.pixel_values if hasattr(inputs, 'pixel_values') else None,
+        image_grid_thw=inputs.image_grid_thw if hasattr(inputs, 'image_grid_thw') else None,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+        eos_token_ids=[processor.tokenizer.eos_token_id] + (processor.tokenizer.additional_special_tokens_ids if hasattr(processor.tokenizer, "additional_special_tokens_ids") else [])
+    )
+    torch.cuda.synchronize()
+    total_time = time.time() - start_time
+    
+    generated_ids = output_ids[0, len(inputs.input_ids[0]):]
+    output = processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
+    
+    return output, new_token, idx, total_time
+
+def get_model_answers(
     base_model_path,
     ea_model_path,
-    questions_file,
+    model_id,
+    questions,
     answer_file,
     max_new_tokens,
+    num_choices,
     temperature,
     args
 ):
     # 1. 加载模型
-    print("Loading model...")
+    print(f"Loading model on device {torch.cuda.current_device()}...")
     model = EaModelVL.from_pretrained(
         base_model_path=base_model_path,
         ea_model_path=ea_model_path,
@@ -386,118 +560,175 @@ def run_eval(
         device_map="auto"
     )
     model.eval()
-    
-    # 加载 Processor
-    print(f"Loading processor from {base_model_path}...")
     processor = AutoProcessor.from_pretrained(base_model_path, trust_remote_code=True)
 
-    # 2. 加载问题
-    import json
+    # 2. 模型预热
+    if questions:
+        print("Warmup starting...")
+        warmup_question = questions[0]
+        for _ in range(3):
+            torch.manual_seed(0)
+            messages = [{"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}]
+            for j in range(len(warmup_question["turns"])):
+                turn = warmup_question["turns"][j]
+                if "image" in warmup_question and j == 0:
+                    content = [{"type": "image", "image": load_image(warmup_question["image"])}, {"type": "text", "text": turn}]
+                else:
+                    content = [{"type": "text", "text": turn}]
+                messages.append({"role": "user", "content": content})
+                output, _, _, _ = generate_single_turn(messages, processor, model, temperature, max_new_tokens)
+                messages.append({"role": "assistant", "content": [{"type": "text", "text": output}]})
+        print("Warmup completed")
+
+    # 3. 批量生成
+    for question in tqdm(questions, desc=f"Generating (GPU {torch.cuda.current_device()})"):
+        choices = []
+        for i in range(num_choices):
+            torch.manual_seed(i)
+            messages = [{"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}]
+            turns, idxs, new_tokens, wall_time = [], [], [], []
+            
+            for j in range(len(question["turns"])):
+                turn = question["turns"][j]
+                if "image" in question and j == 0:
+                    content = [{"type": "image", "image": load_image(question["image"])}, {"type": "text", "text": turn}]
+                else:
+                    content = [{"type": "text", "text": turn}]
+                
+                messages.append({"role": "user", "content": content})
+                output, new_token, idx, total_time = generate_single_turn(
+                    messages, processor, model, temperature, max_new_tokens
+                )
+                
+                turns.append(output)
+                idxs.append(int(idx))
+                new_tokens.append(int(new_token))
+                wall_time.append(total_time)
+                messages.append({"role": "assistant", "content": [{"type": "text", "text": output}]})
+            
+            choices.append({
+                "index": i,
+                "turns": turns,
+                "idxs": idxs,
+                "new_tokens": new_tokens,
+                "wall_time": wall_time
+            })
+
+        # 写入结果
+        os.makedirs(os.path.dirname(answer_file), exist_ok=True)
+        with open(os.path.expanduser(answer_file), "a") as fout:
+            ans_json = {
+                "question_id": question["question_id"],
+                "answer_id": shortuuid.uuid(),
+                "model_id": model_id,
+                "choices": choices,
+                "tstamp": time.time(),
+            }
+            fout.write(json.dumps(ans_json) + "\n")
+
+def run_eval(
+    base_model_path,
+    ea_model_path,
+    model_id,
+    question_file,
+    question_begin,
+    question_end,
+    answer_file,
+    max_new_tokens,
+    num_choices,
+    num_gpus_per_model,
+    num_gpus_total,
+    temperature,
+    args
+):
+    # 1. 加载问题
     questions = []
-    with open(questions_file, 'r') as f:
+    with open(question_file, 'r') as f:
         for line in f:
             questions.append(json.loads(line))
-            
-    if args.question_begin is not None:
-        questions = questions[args.question_begin:]
-    if args.question_end is not None:
-        questions = questions[:args.question_end]
-
-    print(f"Total questions: {len(questions)}")
-
-    # 3. 生成
-    os.makedirs(os.path.dirname(answer_file), exist_ok=True)
     
-    for question in tqdm(questions):
-        # 构造输入
-        messages = []
-        
-        # 处理多轮对话或单轮
-        # 假设 question['turns'] 是列表
-        if 'turns' in question:
-            for j, turn in enumerate(question['turns']):
-                if "image" in question and j == 0:
-                     # 构造多模态消息
-                    content = [
-                        {"type": "image", "image": load_image(question["image"])},
-                        {"type": "text", "text": turn}
-                    ]
-                    messages.append({"role": "user", "content": content})
-                else:
-                    messages.append({"role": "user", "content": turn})
-        else:
-            # 简单处理 text/image 字段
-            text_input = question.get('text', '')
-            image_path = question.get('image', None)
-            content = []
-            if image_path:
-                 content.append({"type": "image", "image": load_image(image_path)})
-            content.append({"type": "text", "text": text_input})
-            messages.append({"role": "user", "content": content})
+    if question_begin is not None:
+        questions = questions[question_begin:]
+    if question_end is not None:
+        questions = questions[:question_end - (question_begin or 0)]
+    
+    print(f"Loaded {len(questions)} questions")
 
-        
-        # 准备输入
-        # Qwen2.5-VL 的 apply_chat_template 会处理图像
-        inputs = processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt"
+    # 2. 分布式判断
+    assert num_gpus_total % num_gpus_per_model == 0
+    use_ray = num_gpus_total // num_gpus_per_model > 1
+
+    if use_ray:
+        import ray
+        ray.init()
+        get_answers_func = ray.remote(num_gpus=num_gpus_per_model)(get_model_answers).remote
+    else:
+        get_answers_func = get_model_answers
+
+    # 3. 提交任务
+    chunk_size = (len(questions) + (num_gpus_total // num_gpus_per_model) - 1) // (num_gpus_total // num_gpus_per_model)
+    ans_handles = []
+    for i in range(0, len(questions), chunk_size):
+        ans_handles.append(
+            get_answers_func(
+                base_model_path,
+                ea_model_path,
+                model_id,
+                questions[i: i + chunk_size],
+                answer_file,
+                max_new_tokens,
+                num_choices,
+                temperature,
+                args
+            )
         )
-        inputs = inputs.to(model.base_model.device)
-        
-        # 生成
-        torch.cuda.synchronize()
-        start_time = time.time()
-        output_ids, new_tokens, _ = model.eagenerate(
-            input_ids=inputs.input_ids,
-            pixel_values=inputs.pixel_values if hasattr(inputs, 'pixel_values') else None,
-            image_grid_thw=inputs.image_grid_thw if hasattr(inputs, 'image_grid_thw') else None,
-            temperature=temperature,
-            max_new_tokens=max_new_tokens,
-            eos_token_ids=[processor.tokenizer.eos_token_id] + (processor.tokenizer.additional_special_tokens_ids if hasattr(processor.tokenizer, "additional_special_tokens_ids") else [])
-        )
-        torch.cuda.synchronize()
-        total_time = time.time() - start_time
-        
-        # 解码
-        generated_ids = output_ids[0, len(inputs.input_ids[0]):]
-        output_text = processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        
-        # 保存结果
-        ans_json = {
-            "question_id": question.get("question_id", shortuuid.uuid()),
-            "text": output_text,
-            "new_tokens": new_tokens,
-            "time": total_time
-        }
-        
-        with open(answer_file, "a") as f:
-            f.write(json.dumps(ans_json) + "\n")
+
+    if use_ray:
+        ray.get(ans_handles)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-model-path", type=str, required=True)
     parser.add_argument("--ea-model-path", type=str, required=True)
+    parser.add_argument("--model-id", type=str, default="qwen2.5-vl-7b")
     parser.add_argument("--question-file", type=str, required=True)
-    parser.add_argument("--answer-file", type=str, required=True)
+    parser.add_argument("--answer-file", type=str, default=None)
+    parser.add_argument("--bench-name", type=str, default="mt_bench")
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--num-choices", type=int, default=1)
     parser.add_argument("--total-token", type=int, default=60)
     parser.add_argument("--depth", type=int, default=5)
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--question-begin", type=int, default=None)
     parser.add_argument("--question-end", type=int, default=None)
+    parser.add_argument("--num-gpus-per-model", type=int, default=1)
+    parser.add_argument("--num-gpus-total", type=int, default=1)
     
     args = parser.parse_args()
+
+    # 补充模型ID
+    args.model_id = f"{args.model_id}-temperature-{args.temperature}"
+    
+    # 确定路径
+    if not args.answer_file:
+        args.answer_file = f"results/{args.bench_name}/{args.model_id}.jsonl"
     
     run_eval(
-        args.base_model_path,
-        args.ea_model_path,
-        args.question_file,
-        args.answer_file,
-        args.max_new_tokens,
-        args.temperature,
-        args
+        base_model_path=args.base_model_path,
+        ea_model_path=args.ea_model_path,
+        model_id=args.model_id,
+        question_file=args.question_file,
+        question_begin=args.question_begin,
+        question_end=args.question_end,
+        answer_file=args.answer_file,
+        max_new_tokens=args.max_new_tokens,
+        num_choices=args.num_choices,
+        num_gpus_per_model=args.num_gpus_per_model,
+        num_gpus_total=args.num_gpus_total,
+        temperature=args.temperature,
+        args=args
     )
+
+    reorg_answer_file(args.answer_file)
+    print(f"✅ All done! Results saved to {args.answer_file}")

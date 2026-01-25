@@ -54,9 +54,9 @@ from transformers.utils import auto_docstring, can_return_tuple, logging
 def maybe_autocast(device_type=None, dtype=None, enabled=True):
     """A simple implementation of maybe_autocast."""
     if device_type == "cuda":
-        return torch.cuda.amp.autocast(dtype=dtype, enabled=enabled)
+        return torch.amp.autocast("cuda", dtype=dtype, enabled=enabled)
     elif device_type == "cpu":
-        return torch.cpu.amp.autocast(dtype=dtype, enabled=enabled)
+        return torch.amp.autocast("cpu", dtype=dtype, enabled=enabled)
     else:
         # 如果不支持，返回一个空上下文管理器
         class NullContext:
@@ -1169,6 +1169,34 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
             causal_mask_mapping = {
                 "full_attention": create_causal_mask(**mask_kwargs),
             }
+            # Handle EAGLE tree mask
+            if hasattr(self, "tree_mask") and self.tree_mask is not None:
+                tree_mask = self.tree_mask
+                tree_len = tree_mask.size(-1)
+                
+                # If create_causal_mask returned None (common with Flash Attention + no attention_mask),
+                # we must create a base causal mask to apply the tree_mask.
+                if causal_mask_mapping["full_attention"] is None:
+                    bsz, seq_len = inputs_embeds.shape[:2]
+                    # We already calculated past_seen_tokens above
+                    src_len = seq_len + past_seen_tokens
+                    
+                    mask = torch.full(
+                        (bsz, 1, seq_len, src_len),
+                        torch.finfo(inputs_embeds.dtype).min,
+                        device=inputs_embeds.device,
+                        dtype=inputs_embeds.dtype
+                    )
+                    mask_cond = torch.arange(seq_len, device=inputs_embeds.device)
+                    if past_seen_tokens > 0:
+                        mask[:, :, :, :past_seen_tokens] = 0
+                    mask[:, :, :, past_seen_tokens:].masked_fill_(
+                        mask_cond < (mask_cond + 1).view(seq_len, 1), 0
+                    )
+                    causal_mask_mapping["full_attention"] = mask
+
+                # Apply tree mask to the last tree_len tokens
+                causal_mask_mapping["full_attention"][:, :, -tree_len:, -tree_len:][tree_mask == 0] = torch.finfo(inputs_embeds.dtype).min
             # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
@@ -1181,7 +1209,7 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         all_self_attns = () if output_attentions else None
 
         for idx, decoder_layer in enumerate(self.layers):
-            if idx==len(self.layers)-3 or idx==len(self.layers)//2 or idx==2:
+            if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             layer_outputs = decoder_layer(

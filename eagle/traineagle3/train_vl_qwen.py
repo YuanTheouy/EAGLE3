@@ -24,7 +24,7 @@ train_config = {
     "num_epochs": args.num_epochs,
     "num_workers": 2,
     "max_len": 2048,
-    "config_path": "/workspace/Models/Qwen2.5-VL-7B-Instruct/config.json",
+    "config_path": args.basepath + "/config.json",
     # "gradient_checkpointing": True
     "gradient_checkpointing": False
 }
@@ -203,17 +203,36 @@ def build_dataset_rank(
 
         return new_examples
 
-    ds1 = ds1.map(
-        preprocess_function,
-        batched=True,
-        num_proc=num_proc,
-        remove_columns=original_columns1,
-        load_from_cache_file=False
-    )
+    # 动态数据处理适配器（避免 map 产生巨大的缓存文件）
+    def transform_adapter(examples):
+        # 检查是否为单样本（通过检查 'id' 是否为 list）
+        if 'id' in examples and not isinstance(examples['id'], list):
+             # 单样本 -> Batch (列表化)
+             examples_batch = {k: [v] for k, v in examples.items()}
+             # 调用原处理函数
+             result_batch = preprocess_function(examples_batch)
+             # Batch -> 单样本 (取第一个元素)
+             # 注意：preprocess_function 返回的字典中，每个 value 都是 list
+             return {k: v[0] if v is not None else None for k, v in result_batch.items()}
+        else:
+             # 已经是 Batch（如果 DataLoader 启用了 batch_sampler）
+             return preprocess_function(examples)
+
+    # 使用 set_transform 进行在线处理，替代 map 的离线缓存机制
+    # 这解决了图文数据集处理后占用数 TB 磁盘空间的问题
+    ds1.set_transform(transform_adapter)
+    
+    # ds1 = ds1.map(
+    #    preprocess_function,
+    #    batched=True,
+    #    num_proc=num_proc,
+    #    remove_columns=original_columns1,
+    #    load_from_cache_file=False
+    # )
     
     # Remove None values if any
     # Or handle in collate
-    ds1.set_format(type="torch")
+    # ds1.set_format(type="torch") # set_transform 已经接管了输出格式，set_format 可能不再需要或冲突
     return ds1
 
 
@@ -356,8 +375,6 @@ world_size = deepspeed.comm.get_world_size()
 if global_rank == 0:
     import wandb
 
-    # wandb.login(key="54225ff98513185d3eb3c41c709b1f8a65a06dee")
-    # wandb.init(project="lamma3-8b-v1", entity="1192445377", config=ds_config)
     
     # 使用环境变量获取API Key（可选）
     api_key = os.environ.get("WANDB_API_KEY", "")
@@ -378,12 +395,13 @@ if global_rank == 0:
 os.makedirs(args.savedir, exist_ok=True)
 
 sampler = DistributedSampler(testdataset, num_replicas=world_size, rank=global_rank, shuffle=False)
-test_loader = DataLoader(testdataset, batch_size=train_config["bs"], sampler=sampler, num_workers=4, pin_memory=True,
+test_loader = DataLoader(testdataset, batch_size=train_config["bs"], sampler=sampler, 
+                         num_workers=train_config["num_workers"], pin_memory=True, prefetch_factor=4,
                          collate_fn=DataCollatorWithPadding())
 
 train_sampler = DistributedSampler(traindataset, num_replicas=world_size, rank=global_rank, shuffle=True)
-train_loader = DataLoader(traindataset, batch_size=train_config["bs"], sampler=train_sampler, num_workers=4,
-                          pin_memory=True,
+train_loader = DataLoader(traindataset, batch_size=train_config["bs"], sampler=train_sampler, 
+                          num_workers=train_config["num_workers"], pin_memory=True, prefetch_factor=4,
                           collate_fn=DataCollatorWithPadding())
 
 

@@ -218,10 +218,16 @@ def initialize_tree(
 
 def reset_tree_mode(model):
     """重置模型的树模式相关参数"""
-    if hasattr(model.base_model.model, "tree_mask"):
-        model.base_model.model.tree_mask = None
-    if hasattr(model.base_model.model, "tree_mode"):
-        model.base_model.model.tree_mode = None
+    # [MODIFIED] Check both base_model.model and language_model for Qwen2.5-VL compatibility
+    target_models = [model.base_model.model]
+    if hasattr(model.base_model.model, "language_model"):
+        target_models.append(model.base_model.model.language_model)
+    
+    for m in target_models:
+        if hasattr(m, "tree_mask"):
+            m.tree_mask = None
+        if hasattr(m, "tree_mode"):
+            m.tree_mode = None
 
 def reset_past_key_values(passed_key_values: List[Tuple[torch.Tensor, torch.Tensor]]) -> List[Tuple[torch.Tensor, torch.Tensor]]:
     """重置Past Key Values的current_length为0（仅支持batch_size=1）"""
