@@ -51,12 +51,12 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.processing_utils import Unpack
 from transformers.utils import auto_docstring, can_return_tuple, logging
 # 实现自己的maybe_autocast函数
-def maybe_autocast(device_type=None, dtype=None):
+def maybe_autocast(device_type=None, dtype=None, enabled=True):
     """A simple implementation of maybe_autocast."""
     if device_type == "cuda":
-        return torch.cuda.amp.autocast(dtype=dtype)
+        return torch.amp.autocast("cuda", dtype=dtype, enabled=enabled)
     elif device_type == "cpu":
-        return torch.cpu.amp.autocast(dtype=dtype)
+        return torch.amp.autocast("cpu", dtype=dtype, enabled=enabled)
     else:
         # 如果不支持，返回一个空上下文管理器
         class NullContext:
@@ -441,6 +441,7 @@ class Qwen2_5_VLPreTrainedModel(PreTrainedModel):
 
     _can_compile_fullgraph = True
     _supports_attention_backend = True
+    config_class = Qwen2_5_VLConfig
 
     def _init_weights(self, module):
         super()._init_weights(module)
@@ -898,7 +899,14 @@ class Qwen2_5_VLAttention(nn.Module):
 
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            if isinstance(past_key_values, list):
+                # EAGLE KVCache list
+                key_cache = past_key_values[self.layer_idx][0]
+                value_cache = past_key_values[self.layer_idx][1]
+                key_states = key_cache.cat(key_states)
+                value_states = value_cache.cat(value_states)
+            else:
+                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -1023,6 +1031,22 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         self.post_init()：父类继承的权重检查 / 初始化兜底，HF 标准范式。
         '''
         super().__init__(config)
+
+        # [PATCH] Ensure rope_parameters exists in config for Qwen2.5-VL compatibility
+        if not hasattr(config, "rope_parameters"):
+            rope_scaling = getattr(config, "rope_scaling", None)
+            if rope_scaling is None:
+                rope_scaling = {}
+            
+            # Construct rope_parameters
+            config.rope_parameters = {
+                "rope_type": rope_scaling.get("type", "default"),
+                "rope_theta": getattr(config, "rope_theta", 1000000.0),
+                "mrope_section": rope_scaling.get("mrope_section", None),
+            }
+            if "factor" in rope_scaling:
+                 config.rope_parameters["factor"] = rope_scaling["factor"]
+
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -1038,6 +1062,12 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
 
     @auto_docstring
     def forward(
@@ -1074,13 +1104,23 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
 
         # torch.jit.trace() doesn't support cache objects in the output
         if use_cache and past_key_values is None and not torch.jit.is_tracing():
-            past_key_values = DynamicCache(config=self.config)
+            past_key_values = DynamicCache()
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            if past_key_values is not None:
+                if isinstance(past_key_values, list):
+                    if hasattr(past_key_values[0], 'current_length'):
+                        past_seen_tokens = past_key_values[0].current_length.item()
+                    else:
+                        past_seen_tokens = past_key_values[0][0].shape[2]
+                else:
+                    past_seen_tokens = past_key_values.get_seq_length()
+            else:
+                past_seen_tokens = 0
+            
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
@@ -1111,18 +1151,52 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
             # Prepare mask arguments
+            # Handle EAGLE's list-based past_key_values which breaks create_causal_mask
+            # create_causal_mask expects a Cache object with get_mask_sizes()
+            _past_key_values = past_key_values
+            if isinstance(past_key_values, list):
+                _past_key_values = None
+            
             mask_kwargs = {
                 "config": self.config,
                 "input_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
                 "cache_position": cache_position,
-                "past_key_values": past_key_values,
+                "past_key_values": _past_key_values,
                 "position_ids": text_position_ids,
             }
             # Create the masks
             causal_mask_mapping = {
                 "full_attention": create_causal_mask(**mask_kwargs),
             }
+            # Handle EAGLE tree mask
+            if hasattr(self, "tree_mask") and self.tree_mask is not None:
+                tree_mask = self.tree_mask
+                tree_len = tree_mask.size(-1)
+                
+                # If create_causal_mask returned None (common with Flash Attention + no attention_mask),
+                # we must create a base causal mask to apply the tree_mask.
+                if causal_mask_mapping["full_attention"] is None:
+                    bsz, seq_len = inputs_embeds.shape[:2]
+                    # We already calculated past_seen_tokens above
+                    src_len = seq_len + past_seen_tokens
+                    
+                    mask = torch.full(
+                        (bsz, 1, seq_len, src_len),
+                        torch.finfo(inputs_embeds.dtype).min,
+                        device=inputs_embeds.device,
+                        dtype=inputs_embeds.dtype
+                    )
+                    mask_cond = torch.arange(seq_len, device=inputs_embeds.device)
+                    if past_seen_tokens > 0:
+                        mask[:, :, :, :past_seen_tokens] = 0
+                    mask[:, :, :, past_seen_tokens:].masked_fill_(
+                        mask_cond < (mask_cond + 1).view(seq_len, 1), 0
+                    )
+                    causal_mask_mapping["full_attention"] = mask
+
+                # Apply tree mask to the last tree_len tokens
+                causal_mask_mapping["full_attention"][:, :, -tree_len:, -tree_len:][tree_mask == 0] = torch.finfo(inputs_embeds.dtype).min
             # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
@@ -1489,6 +1563,10 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             The temporal, height and width of feature shape of each image in LLM.
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
             The temporal, height and width of feature shape of each video in LLM.
+        pixel_values (`torch.Tensor` of shape `(num_images, num_channels, image_size, image_size)`, *optional*):
+            The tensors corresponding to the input images.
+        pixel_values_videos (`torch.FloatTensor` of shape `(num_videos, num_channels, image_size, image_size)`, *optional*):
+            The tensors corresponding to the input videos.
         rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
             The rope index difference between sequence length and multimodal rope.
         second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
@@ -1521,7 +1599,14 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         if position_ids is None:
-            past_key_values_length = 0 if past_key_values is None else past_key_values.get_seq_length()
+            if past_key_values is None:
+                past_key_values_length = 0
+            elif isinstance(past_key_values, list):
+                # EAGLE uses list of KVCache objects
+                past_key_values_length = past_key_values[0][0].current_length.item()
+            else:
+                past_key_values_length = past_key_values.get_seq_length()
+                
             if self.rope_deltas is None or past_key_values_length == 0:
                 position_ids, rope_deltas = self.get_rope_index(
                     input_ids,
@@ -1667,6 +1752,10 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             The temporal, height and width of feature shape of each image in LLM.
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
             The temporal, height and width of feature shape of each video in LLM.
+        pixel_values (`torch.Tensor` of shape `(num_images, num_channels, image_size, image_size)`, *optional*):
+            The tensors corresponding to the input images.
+        pixel_values_videos (`torch.FloatTensor` of shape `(num_videos, num_channels, image_size, image_size)`, *optional*):
+            The tensors corresponding to the input videos.
         rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
             The rope index difference between sequence length and multimodal rope.
         second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):

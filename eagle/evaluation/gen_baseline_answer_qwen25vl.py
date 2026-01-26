@@ -59,24 +59,14 @@ def run_eval(
             for line in fin:
                 questions.append(json.loads(line))
         
-        # 默认只运行20个问题（如果没有指定范围）
-        if question_begin is None and question_end is None:
-            print("注意：没有指定问题范围，默认只运行前20个问题进行测试")
-            questions = questions[:20]
-        else:
-            # 应用问题范围筛选
-            if question_begin is not None:
-                questions = questions[question_begin:]
-            if question_end is not None:
-                questions = questions[:question_end - (question_begin or 0)]
+        # 应用问题范围筛选
+        if question_begin is not None:
+            questions = questions[question_begin:]
+        if question_end is not None:
+            questions = questions[:question_end - (question_begin or 0)]
     else:
         # fastchat的标准加载函数
-        if question_begin is None and question_end is None:
-            # 默认只运行20个问题
-            print("注意：没有指定问题范围，默认只运行前20个问题进行测试")
-            questions = load_questions(question_file, 0, 20)
-        else:
-            questions = load_questions(question_file, question_begin, question_end)
+        questions = load_questions(question_file, question_begin, question_end)
 
     # 2. 是否启用Ray分布式：总GPU数 / 单模型GPU数 > 1 → 分布式
     assert num_gpus_total % num_gpus_per_model == 0
