@@ -1,3 +1,16 @@
 .DS_Store
 wandb/
 wandb_test/
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+cache.pt
+
+venv/
+ea_env/
+
+*.log
+*.tmp
