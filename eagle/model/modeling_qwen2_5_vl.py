@@ -1209,7 +1209,7 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         all_self_attns = () if output_attentions else None
 
         for idx, decoder_layer in enumerate(self.layers):
-            if idx==len(self.layers)-3 or idx==len(self.layers)//2 or idx==2:
+            if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             layer_outputs = decoder_layer(

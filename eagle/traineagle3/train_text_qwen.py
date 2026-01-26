@@ -23,7 +23,7 @@ train_config = {
     "num_epochs": args.num_epochs,
     "num_workers": 2,
     "max_len": 2048,
-    "config_path": "/workspace/Models/Qwen2.5-7B-Instruct/config.json",
+    "config_path": "/workspace/Models/Qwen2.5-VL-7B-Instruct/config.json",
     # "gradient_checkpointing": True
     "gradient_checkpointing": False
 }
