@@ -491,35 +491,69 @@ class Model(nn.Module):
         if load_emb and not hasattr(config, "target_hidden_size"):
             from safetensors import safe_open
             import json
-            try:
-                index_json_path = os.path.join(path, "model.safetensors.index.json")
-                if not os.path.exists(index_json_path):
-                    index_json_path = hf_hub_download(path, "model.safetensors.index.json")
-                with open(index_json_path, "r") as f:
-                    index_json = json.loads(f.read())
-                    emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
-                local_emb_path = os.path.join(path, emb_path)
-                if not os.path.exists(local_emb_path):
-                    local_emb_path = hf_hub_download(path, emb_path)
-                with safe_open(local_emb_path,
-                               framework="pt",
-                               device="cpu") as f:
-                    tensor_slice = f.get_slice("model.embed_tokens.weight")
-                    vocab_size, hidden_dim = tensor_slice.get_shape()
-                    tensor = tensor_slice[:, :hidden_dim].float()
-            except:
-                index_json_path = os.path.join(path, "pytorch_model.bin.index.json")
-                if not os.path.exists(index_json_path):
-                    index_json_path = hf_hub_download(path, "pytorch_model.bin.index.json")
-                with open(index_json_path, "r") as f:
-                    index_json = json.loads(f.read())
-                    emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
-                local_emb_path = os.path.join(path, emb_path)
-                if not os.path.exists(local_emb_path):
-                    local_emb_path = hf_hub_download(path, emb_path)
-                weights = torch.load(local_emb_path)
-                tensor = weights["model.embed_tokens.weight"].float()
-            self.embed_tokens.weight.data = tensor
+            tensor = None
+            
+            # 1. Try safetensors (non-sharded)
+            st_path = os.path.join(path, "model.safetensors")
+            if os.path.exists(st_path):
+                try:
+                    with safe_open(st_path, framework="pt", device="cpu") as f:
+                        if "model.embed_tokens.weight" in f.keys():
+                            tensor_slice = f.get_slice("model.embed_tokens.weight")
+                            vocab_size, hidden_dim = tensor_slice.get_shape()
+                            tensor = tensor_slice[:, :hidden_dim].float()
+                except Exception as e:
+                    print(f"Error loading {st_path}: {e}")
+
+            # 2. Try safetensors (sharded)
+            if tensor is None:
+                index_path = os.path.join(path, "model.safetensors.index.json")
+                if os.path.exists(index_path):
+                    try:
+                        with open(index_path, "r") as f:
+                            index = json.load(f)
+                        if "model.embed_tokens.weight" in index["weight_map"]:
+                            shard_file = index["weight_map"]["model.embed_tokens.weight"]
+                            shard_path = os.path.join(path, shard_file)
+                            if os.path.exists(shard_path):
+                                with safe_open(shard_path, framework="pt", device="cpu") as f:
+                                    tensor_slice = f.get_slice("model.embed_tokens.weight")
+                                    vocab_size, hidden_dim = tensor_slice.get_shape()
+                                    tensor = tensor_slice[:, :hidden_dim].float()
+                    except Exception as e:
+                        print(f"Error loading {index_path}: {e}")
+
+            # 3. Try pytorch_model.bin (non-sharded)
+            if tensor is None:
+                pt_path = os.path.join(path, "pytorch_model.bin")
+                if os.path.exists(pt_path):
+                    try:
+                        weights = torch.load(pt_path, map_location="cpu")
+                        if "model.embed_tokens.weight" in weights:
+                            tensor = weights["model.embed_tokens.weight"].float()
+                    except Exception as e:
+                        print(f"Error loading {pt_path}: {e}")
+            
+            # 4. Try pytorch_model.bin (sharded)
+            if tensor is None:
+                index_path = os.path.join(path, "pytorch_model.bin.index.json")
+                if os.path.exists(index_path):
+                    try:
+                        with open(index_path, "r") as f:
+                            index = json.load(f)
+                        if "model.embed_tokens.weight" in index["weight_map"]:
+                            shard_file = index["weight_map"]["model.embed_tokens.weight"]
+                            shard_path = os.path.join(path, shard_file)
+                            if os.path.exists(shard_path):
+                                weights = torch.load(shard_path, map_location="cpu")
+                                tensor = weights["model.embed_tokens.weight"].float()
+                    except Exception as e:
+                        print(f"Error loading {index_path}: {e}")
+
+            if tensor is not None:
+                self.embed_tokens.weight.data = tensor
+            else:
+                print(f"Warning: Could not load embeddings from {path}. Using random initialization.")
 
         self.top_k = top_k
         self.total_tokens = total_tokens - 1

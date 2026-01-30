@@ -128,14 +128,103 @@ class EaModelVL(torch.nn.Module):
         if self.ea_layer.diff_device:
             self.ea_layer.headweight = self.base_model.lm_head.weight.clone().to(device)
             
+        # 检查是否为小词表模式
         if ea_config.vocab_size == ea_config.draft_vocab_size:
+            print("Note: Draft vocab size equals Base vocab size. No clustering used.")
             if hasattr(self.ea_layer, "d2t"): del self.ea_layer.d2t
             if hasattr(self.ea_layer, "t2d"): del self.ea_layer.t2d
-            
+        else:
+            print(f"Note: Using Small Vocab Clustering. Base: {ea_config.vocab_size}, Draft: {ea_config.draft_vocab_size}")
+            # 必须确保 d2t/t2d 被正确加载
+            if hasattr(self.ea_layer, "d2t"):
+                # 检查 d2t 是否全为 0 (意味着未加载或初始化失败)
+                if self.ea_layer.d2t.sum() == 0:
+                    print("CRITICAL WARNING: d2t (Draft-to-Token map) is all zeros! Weights likely not loaded for buffers.")
+                    # 尝试从 state_dict 中手动查找并加载
+                    for k, v in new_state_dict.items():
+                        if "d2t" in k:
+                            print(f"Found d2t in weights: {k}, shape: {v.shape}")
+                            self.ea_layer.d2t.data = v.to(device)
+                        if "t2d" in k:
+                             self.ea_layer.t2d.data = v.to(device)
+                    
+                    if self.ea_layer.d2t.sum() == 0:
+                        print("ERROR: Failed to load d2t mapping! This will cause 100% rejection rate.")
+
         # 加载权重
         print("Loading Eagle Layer weights...")
-        self.ea_layer.load_state_dict(ea_layer_state_dict, strict=False)
+        
+        # 处理可能的 Key 前缀不匹配问题
+        new_state_dict = {}
+        for k, v in ea_layer_state_dict.items():
+            # 去除可能的 module. 前缀 (DDP)
+            if k.startswith("module."):
+                k = k[7:]
+            # 去除可能的 base_model. 前缀 (如果在某些训练框架下保存)
+            if k.startswith("base_model."):
+                k = k[11:]
+            new_state_dict[k] = v
+
+        # 移动到这里，确保 new_state_dict 已经准备好
+        # 检查是否为小词表模式
+        if ea_config.vocab_size == ea_config.draft_vocab_size:
+            print("Note: Draft vocab size equals Base vocab size. No clustering used.")
+            if hasattr(self.ea_layer, "d2t"): del self.ea_layer.d2t
+            if hasattr(self.ea_layer, "t2d"): del self.ea_layer.t2d
+        else:
+            print(f"Note: Using Small Vocab Clustering. Base: {ea_config.vocab_size}, Draft: {ea_config.draft_vocab_size}")
+            # 必须确保 d2t/t2d 被正确加载
+            if hasattr(self.ea_layer, "d2t"):
+                # 先加载权重（包括 buffers）
+                missing_keys, unexpected_keys = self.ea_layer.load_state_dict(new_state_dict, strict=False)
+                
+                # 检查 d2t 是否全为 0
+                if self.ea_layer.d2t.sum() == 0:
+                     print("CRITICAL WARNING: d2t is all zeros after load_state_dict!")
+                     # 再次尝试手动加载（双重保险）
+                     for k, v in new_state_dict.items():
+                        if "d2t" in k:
+                            print(f"Found d2t in weights: {k}, shape: {v.shape}")
+                            self.ea_layer.d2t.data = v.to(device)
+                        if "t2d" in k:
+                             self.ea_layer.t2d.data = v.to(device)
+
+        
+        # 统一执行加载（覆盖上面的逻辑，确保 missing_keys 变量存在）
+        missing_keys, unexpected_keys = self.ea_layer.load_state_dict(new_state_dict, strict=False)
+        
+        # 再次检查 d2t (如果在小词表模式下)
+        if ea_config.vocab_size != ea_config.draft_vocab_size and hasattr(self.ea_layer, "d2t"):
+             if self.ea_layer.d2t.sum() == 0:
+                  print("CRITICAL WARNING: d2t is still zero after unified load_state_dict!")
+        
+        if len(missing_keys) > 0:
+            # 过滤掉 embed_tokens.weight，因为我们已经手动复制了
+             filtered_missing = [k for k in missing_keys if "embed_tokens.weight" not in k]
+             
+             # 如果是小词表模式，d2t/t2d 必须存在
+             if ea_config.vocab_size != ea_config.draft_vocab_size:
+                 if "d2t" in missing_keys or "t2d" in missing_keys:
+                     print("CRITICAL ERROR: d2t or t2d mapping buffers are missing from checkpoint! Small vocab clustering cannot work.")
+             
+             if len(filtered_missing) > 0:
+                print(f"WARNING: Missing keys in Eagle Layer: {filtered_missing[:5]} ... (Total {len(filtered_missing)})")
+                # 关键：检查核心权重是否缺失
+                if "midlayer.layers.0.self_attn.q_proj.weight" in filtered_missing or "fc.weight" in filtered_missing:
+                    print("CRITICAL WARNING: Core Eagle weights are missing! Performance will be degraded to random guessing.")
+        
+        if len(unexpected_keys) > 0:
+            print(f"WARNING: Unexpected keys in Eagle weights: {unexpected_keys[:5]} ... (Total {len(unexpected_keys)})")
+            
         self.ea_layer.to(self.base_model.dtype).to(device)
+        
+        # 验证 Embedding Norm
+        eagle_emb_norm = self.ea_layer.embed_tokens.weight.norm().item()
+        if hasattr(self.base_model, "model") and hasattr(self.base_model.model, "embed_tokens"):
+             base_emb_norm = self.base_model.model.embed_tokens.weight.norm().item()
+             print(f"Embedding Norm Check - Base: {base_emb_norm:.4f}, Eagle: {eagle_emb_norm:.4f}")
+        else:
+             print(f"Eagle Embedding Norm: {eagle_emb_norm:.4f}")
         
         # 初始化树结构
         self.ea_layer.init_tree()
@@ -153,14 +242,25 @@ class EaModelVL(torch.nn.Module):
         ):
         # 加载 Eagle 权重
         ea_layer_state_dict = {}
-        if os.path.exists(os.path.join(ea_model_path, "pytorch_model.bin")):
-            ea_layer_state_dict = torch.load(os.path.join(ea_model_path, "pytorch_model.bin"))
+        ea_weight_path = os.path.join(ea_model_path, "pytorch_model.bin")
+        if os.path.exists(ea_weight_path):
+            print(f"Loading Eagle weights from {ea_weight_path}")
+            ea_layer_state_dict = torch.load(ea_weight_path, map_location='cpu')
         else:
-             # 支持 safetensors 或分片权重 (这里简化处理，假设是 pytorch_model.bin)
-             # 如果是 safetensors，可以使用 safe_open
-             from safetensors.torch import load_file
-             if os.path.exists(os.path.join(ea_model_path, "model.safetensors")):
-                 ea_layer_state_dict = load_file(os.path.join(ea_model_path, "model.safetensors"))
+             # 支持 safetensors 或分片权重
+             ea_weight_path = os.path.join(ea_model_path, "model.safetensors")
+             if os.path.exists(ea_weight_path):
+                 print(f"Loading Eagle weights from {ea_weight_path}")
+                 from safetensors.torch import load_file
+                 ea_layer_state_dict = load_file(ea_weight_path, device='cpu')
+             else:
+                 # 尝试 adapter_model.bin (LoRA 风格)
+                 ea_weight_path = os.path.join(ea_model_path, "adapter_model.bin")
+                 if os.path.exists(ea_weight_path):
+                     print(f"Loading Eagle weights from {ea_weight_path}")
+                     ea_layer_state_dict = torch.load(ea_weight_path, map_location='cpu')
+                 else:
+                     print(f"WARNING: No Eagle weights found in {ea_model_path}. Please check your path!")
         
         return cls(
             base_model_path=base_model_path,
